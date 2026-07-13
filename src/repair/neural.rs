@@ -42,7 +42,13 @@ impl NeuralState {
             config.n_fft,
             config.target_sr,
         )?;
-        let sessions = Sessions::load(&config.model_onnx)?;
+        let sessions = Sessions::load(&config.model_onnx).with_context(|| {
+            format!(
+                "loading UniverSR model {}; install the default model with \
+                 `sidespread model download`",
+                config.model_onnx.display()
+            )
+        })?;
         if sessions.hr_bins != config.hr_freq_bins {
             bail!(
                 "ONNX model has {} generated bins, config expects {}",

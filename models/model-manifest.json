@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "models": {
+    "universr_backbone": {
+      "url": "https://assets.sidespread.pwp.sh/models/universr_backbone-7f4f428eb8200fdb632612075fc815439d3debd4221a135fa6b09931cf59a60c.onnx",
+      "sha256": "7f4f428eb8200fdb632612075fc815439d3debd4221a135fa6b09931cf59a60c",
+      "size_bytes": 231995304,
+      "license": "MIT",
+      "license_url": "https://assets.sidespread.pwp.sh/licenses/UniverSR-MIT.txt"
+    }
+  }
+}

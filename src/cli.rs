@@ -96,11 +96,42 @@ pub enum Command {
         #[arg(long, value_name = "HZ", default_value_t = 8000)]
         fc: usize,
     },
+    /// Download or verify the optional UniverSR model.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ModelCommand {
+    /// Download the prebuilt model and verify its SHA-256.
+    Download {
+        #[arg(
+            short,
+            long,
+            value_name = "PATH",
+            default_value = "models/universr_backbone.onnx"
+        )]
+        output: PathBuf,
+        /// Replace an existing model, even if it is already valid.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Verify the size and SHA-256 of a downloaded model.
+    Verify {
+        #[arg(value_name = "PATH", default_value = "models/universr_backbone.onnx")]
+        path: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Model { command } => match command {
+            ModelCommand::Download { output, force } => crate::model::download(&output, force),
+            ModelCommand::Verify { path } => crate::model::verify(&path),
+        },
         Command::Info { input, fc } => pipeline::info(&input, fc),
         Command::Detect {
             input,

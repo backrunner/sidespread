@@ -5,5 +5,6 @@ pub mod cli;
 pub mod config;
 pub mod eval;
 pub mod io;
+pub mod model;
 pub mod pipeline;
 pub mod repair;

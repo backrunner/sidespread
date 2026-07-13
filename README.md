@@ -48,15 +48,14 @@ Use `sidespread <command> --help` for all options. Sidespread accepts stereo WAV
 
 ## Neural Repair
 
-The neural route uses the MIT-licensed UniverSR model. The 221 MB ONNX file is not stored in Git or
-bundled with release archives. Build it locally with:
+The neural route uses the MIT-licensed UniverSR model. The 221 MB ONNX file is hosted on Cloudflare
+R2 rather than GitHub storage. Download and verify the prebuilt model with:
 
 ```bash
-python3 scripts/build_universr_model.py
+sidespread model download
 ```
 
-The script creates an isolated Python environment, downloads the upstream weights, and writes
-`models/universr_backbone.onnx`. You can then use automatic routing or force neural repair:
+You can then use automatic routing or force neural repair:
 
 ```bash
 sidespread process song.wav --mode nn
@@ -65,6 +64,9 @@ sidespread process song.wav --mode nn
 The bundled neural condition is designed for the default cutoff near 8 kHz. Custom cutoff values
 remain available for detection and DSP repair.
 
+To reproduce the ONNX export from the upstream PyTorch weights instead, run
+`python3 scripts/build_universr_model.py`.
+
 ## Development
 
 ```bash
@@ -72,6 +74,11 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 ```
+
+## Releases
+
+Set the version in `Cargo.toml`, commit it, then push a matching tag such as `v0.1.0`. GitHub
+Actions builds Linux, macOS, and Windows archives, adds checksums, and publishes the release.
 
 ## License
 
