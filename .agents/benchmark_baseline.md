@@ -6,17 +6,21 @@ Recorded 2026-07-14 on macOS arm64 using the release build and CPUExecutionProvi
 
 - Input: 10 seconds, 48 kHz stereo WAV.
 - Command: `sidespread process ... --mode dsp`.
-- Wall time: 0.23 seconds.
-- CPU time: 0.20 seconds.
-- RTF: 0.023 (target: < 0.1).
+- Original warm wall time: 0.26-0.27 seconds.
+- Parallel routing + cached FFT warm wall time: 0.19-0.20 seconds.
+- Current RTF: 0.019-0.020 (target: < 0.1).
+- The optimized WAV and JSON report are byte-identical to the serial baseline.
 
 ## UniverSR Route
 
-- Input: 1 second, 48 kHz stereo WAV; fixed 32768-sample model chunks with 50% overlap.
+- Validation input: one fixed 32768-sample (0.683-second) model context at 48 kHz.
 - ODE: four midpoint steps, CFG 1.5.
-- Wall time: 47.66 seconds on CPU while the host was under concurrent build load.
-- Maximum resident set size: 1,843,462,144 bytes.
-- Peak memory footprint: 1,962,264,592 bytes (target: < 2 GB).
+- Current full 32768-sample ODE/iSTFT validation: 26.37 seconds on an otherwise idle host.
+- Current RTF for the fixed 0.683-second context: 38.6.
+- Maximum resident set size: 1,836,433,408 bytes.
+- Historical peak memory footprint: 1,962,264,592 bytes (target: < 2 GB).
+- ONNX intra-op inference remains at one thread because the measured memory headroom is too small
+  to increase parallelism without risking the 2 GB limit.
 
 ## Numerical Validation
 

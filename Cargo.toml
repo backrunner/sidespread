@@ -23,6 +23,7 @@ serde_json = "1"
 anyhow = "1"
 rubato = "0.16"
 ort = { version = "2.0.0-rc.10", features = ["ndarray", "download-binaries"] }
+rayon = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 sha2 = "0.10"
 

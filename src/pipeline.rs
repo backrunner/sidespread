@@ -12,6 +12,7 @@ use crate::eval::synthetic;
 use crate::io::{lr_to_ms, ms_to_lr, read_wav, write_wav, AudioBuffer};
 use crate::repair;
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use std::path::Path;
 
 pub fn info<P: AsRef<Path>>(input: P, fc: usize) -> Result<()> {
@@ -211,7 +212,7 @@ fn analyze_all(
 ) -> (Vec<Segment>, Vec<SegmentReport>) {
     let ranges = segments(m.len(), sample_rate, config.segment_ms, config.overlap);
     let reports = ranges
-        .iter()
+        .par_iter()
         .map(|segment| {
             analysis::analyze(
                 &m[segment.start..segment.end],
@@ -265,28 +266,38 @@ fn repair_segments(
     let mut accumulated = vec![0.0f32; s.len()];
     let mut weights = vec![0.0f32; s.len()];
 
-    for (segment, report) in ranges.iter().zip(reports) {
-        let s_segment = &s[segment.start..segment.end];
-        let m_segment = &m[segment.start..segment.end];
-        let repaired = match report.route {
-            Route::Skip => s_segment.to_vec(),
-            Route::Dsp => repair::dsp::repair(m_segment, s_segment, config, sample_rate),
-            Route::Neural => neural_candidate.as_ref().expect("neural candidate exists")
-                [segment.start..segment.end]
-                .to_vec(),
-            Route::Hybrid => {
-                let dsp = repair::dsp::repair(m_segment, s_segment, config, sample_rate);
-                let neural = &neural_candidate.as_ref().expect("neural candidate exists")
-                    [segment.start..segment.end];
-                dsp.iter()
-                    .zip(neural)
-                    .map(|(dsp, neural)| 0.7 * dsp + 0.3 * neural)
-                    .collect()
+    let repaired_segments = ranges
+        .par_iter()
+        .zip(reports.par_iter())
+        .map(|(segment, report)| {
+            let s_segment = &s[segment.start..segment.end];
+            let m_segment = &m[segment.start..segment.end];
+            let repaired = match report.route {
+                Route::Skip => s_segment.to_vec(),
+                Route::Dsp => repair::dsp::repair(m_segment, s_segment, config, sample_rate),
+                Route::Neural => neural_candidate.as_ref().expect("neural candidate exists")
+                    [segment.start..segment.end]
+                    .to_vec(),
+                Route::Hybrid => {
+                    let dsp = repair::dsp::repair(m_segment, s_segment, config, sample_rate);
+                    let neural = &neural_candidate.as_ref().expect("neural candidate exists")
+                        [segment.start..segment.end];
+                    dsp.iter()
+                        .zip(neural)
+                        .map(|(dsp, neural)| 0.7 * dsp + 0.3 * neural)
+                        .collect()
+                }
+            };
+            if repaired.len() != segment.end - segment.start {
+                bail!("repair route returned an unexpected segment length");
             }
-        };
-        if repaired.len() != segment.end - segment.start {
-            bail!("repair route returned an unexpected segment length");
-        }
+            Ok(repaired)
+        })
+        .collect::<Vec<Result<Vec<f32>>>>()
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+
+    for (segment, repaired) in ranges.iter().zip(repaired_segments) {
         add_segment(
             &mut accumulated,
             &mut weights,

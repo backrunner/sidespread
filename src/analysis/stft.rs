@@ -1,6 +1,15 @@
 //! STFT / iSTFT via realfft with Hann window and overlap-add.
 
-use realfft::RealFftPlanner;
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+#[derive(Clone)]
+struct FftResources {
+    forward: Arc<dyn RealToComplex<f32>>,
+    inverse: Arc<dyn ComplexToReal<f32>>,
+    window: Arc<[f32]>,
+}
 
 /// Configuration for STFT analysis/synthesis.
 #[derive(Debug, Clone, Copy)]
@@ -17,10 +26,7 @@ impl StftConfig {
 
     /// Hann window of length `n_fft` with periodic normalization (numpy/librosa `ones`).
     pub fn window(&self) -> Vec<f32> {
-        let n = self.n_fft;
-        (0..n)
-            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
-            .collect()
+        hann_window(self.n_fft)
     }
 
     /// Number of frames for `len` samples with center padding (librosa `center=True`).
@@ -66,7 +72,8 @@ impl SpectrumFrame {
 pub fn stft(signal: &[f32], cfg: &StftConfig) -> Vec<SpectrumFrame> {
     let n = cfg.n_fft;
     let hop = cfg.hop;
-    let win = cfg.window();
+    let resources = fft_resources(n);
+    let win = &resources.window;
     let n_bins = n / 2 + 1;
 
     // Center pad using reflection that remains well-defined for short tail segments.
@@ -83,12 +90,12 @@ pub fn stft(signal: &[f32], cfg: &StftConfig) -> Vec<SpectrumFrame> {
         1
     };
 
-    let mut planner: RealFftPlanner<f32> = RealFftPlanner::new();
-    let r2c = planner.plan_fft_forward(n);
+    let r2c = resources.forward;
 
     let mut frames = Vec::with_capacity(num_frames);
     let mut frame_buf = vec![0.0f32; n];
     let mut spectrum = r2c.make_output_vec();
+    let mut scratch = r2c.make_scratch_vec();
 
     for f in 0..num_frames {
         let start = f * hop;
@@ -104,7 +111,7 @@ pub fn stft(signal: &[f32], cfg: &StftConfig) -> Vec<SpectrumFrame> {
             c.re = 0.0;
             c.im = 0.0;
         });
-        r2c.process(&mut frame_buf, &mut spectrum)
+        r2c.process_with_scratch(&mut frame_buf, &mut spectrum, &mut scratch)
             .expect("realfft forward buffer sizes are valid");
         let mut sf = SpectrumFrame::new(n_bins);
         for (bin, value) in spectrum.iter().enumerate().take(n_bins) {
@@ -121,11 +128,11 @@ pub fn stft(signal: &[f32], cfg: &StftConfig) -> Vec<SpectrumFrame> {
 pub fn istft(frames: &[SpectrumFrame], cfg: &StftConfig, expected_len: usize) -> Vec<f32> {
     let n = cfg.n_fft;
     let hop = cfg.hop;
-    let win = cfg.window();
+    let resources = fft_resources(n);
+    let win = &resources.window;
     let n_bins = n / 2 + 1;
 
-    let mut planner: RealFftPlanner<f32> = RealFftPlanner::new();
-    let c2r = planner.plan_fft_inverse(n);
+    let c2r = resources.inverse;
 
     let num_frames = frames.len();
     let out_len = if num_frames > 0 {
@@ -138,6 +145,7 @@ pub fn istft(frames: &[SpectrumFrame], cfg: &StftConfig, expected_len: usize) ->
     let mut norm = vec![0.0f32; out_len];
     let mut spectrum_in = c2r.make_input_vec();
     let mut frame_out = vec![0.0f32; n];
+    let mut scratch = c2r.make_scratch_vec();
 
     for (frame_index, frame) in frames.iter().enumerate().take(num_frames) {
         for (bin, value) in spectrum_in
@@ -150,7 +158,7 @@ pub fn istft(frames: &[SpectrumFrame], cfg: &StftConfig, expected_len: usize) ->
         }
         spectrum_in[0].im = 0.0;
         spectrum_in[n_bins - 1].im = 0.0;
-        c2r.process(&mut spectrum_in, &mut frame_out)
+        c2r.process_with_scratch(&mut spectrum_in, &mut frame_out, &mut scratch)
             .expect("realfft inverse buffer sizes are valid");
         // realfft's inverse does NOT normalize by 1/n; numpy's irfft does. Match numpy.
         let scale = 1.0 / n as f32;
@@ -178,6 +186,29 @@ pub fn istft(frames: &[SpectrumFrame], cfg: &StftConfig, expected_len: usize) ->
         return vec![];
     }
     out[trimmed_start..trimmed_end].to_vec()
+}
+
+fn fft_resources(n_fft: usize) -> FftResources {
+    static CACHE: OnceLock<Mutex<HashMap<usize, FftResources>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().expect("FFT resource cache is not poisoned");
+    cache
+        .entry(n_fft)
+        .or_insert_with(|| {
+            let mut planner = RealFftPlanner::<f32>::new();
+            FftResources {
+                forward: planner.plan_fft_forward(n_fft),
+                inverse: planner.plan_fft_inverse(n_fft),
+                window: Arc::from(hann_window(n_fft)),
+            }
+        })
+        .clone()
+}
+
+fn hann_window(length: usize) -> Vec<f32> {
+    (0..length)
+        .map(|index| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * index as f32 / length as f32).cos())
+        .collect()
 }
 
 fn reflect_index(mut index: isize, len: usize) -> Option<usize> {
