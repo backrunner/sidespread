@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: Select Rust
+        run: rustup default stable
+      - name: Match tag to Cargo version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo version ${version}." >&2
+            exit 1
+          fi
+      - name: Verify source
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
+  build:
+    name: Package on ${{ matrix.os }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Select Rust
+        run: rustup default stable
+      - name: Build release binary
+        run: cargo build --locked --release
+      - name: Stage release archive
+        shell: bash
+        run: |
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          name="sidespread-${GITHUB_REF_NAME}-${target}"
+          package="dist/${name}"
+
+          mkdir -p "${package}/models" "${package}/THIRD_PARTY_LICENSES"
+          cp README.md LICENSE "${package}/"
+          cp models/universr_config.json models/model-manifest.json "${package}/models/"
+          cp THIRD_PARTY_LICENSES/UniverSR-MIT.txt "${package}/THIRD_PARTY_LICENSES/"
+
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            cp target/release/sidespread.exe "${package}/"
+          else
+            cp target/release/sidespread "${package}/"
+          fi
+
+          shopt -s nullglob
+          runtime_libraries=(target/release/*.dll target/release/*.so target/release/*.dylib)
+          if (( ${#runtime_libraries[@]} )); then
+            cp "${runtime_libraries[@]}" "${package}/"
+          fi
+
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            pushd dist
+            7z a "${name}.zip" "${name}"
+            popd
+          else
+            tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ runner.os }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes --title "Sidespread ${GITHUB_REF_NAME}"

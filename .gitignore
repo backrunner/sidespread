@@ -1,5 +1,6 @@
 # Rust build output
 /target/
+/dist/
 
 # Local Python/model tooling
 /.venv/
