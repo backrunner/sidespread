@@ -1,0 +1,23 @@
+# Rust build output
+/target/
+
+# Local Python/model tooling
+/.venv/
+/external/
+__pycache__/
+*.py[cod]
+
+# Generated and downloaded model binaries
+/models/*.onnx
+
+# Local audio and reports
+*.wav
+report.json
+*.report.json
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

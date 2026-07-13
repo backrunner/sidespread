@@ -1,0 +1,24 @@
+{
+  "n_fft": 1024,
+  "hop_length": 512,
+  "window_fn": "hann",
+  "sampling_rate": 48000,
+  "alpha": 0.2,
+  "beta": 1,
+  "comp_eps": 0.0001,
+  "total_freq_bins": 512,
+  "hr_freq_bins": 432,
+  "sr_to_lr_bins": {
+    "8": 80,
+    "12": 128,
+    "16": 170,
+    "24": 256
+  },
+  "sigma_min": 0.0001,
+  "guidance_scale": 1.5,
+  "ode_steps": 4,
+  "ode_method": "midpoint",
+  "min_samples": 32768,
+  "target_sr": 48000,
+  "model_onnx": "universr_backbone.onnx"
+}
