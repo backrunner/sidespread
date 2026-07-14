@@ -160,8 +160,15 @@ fn eval_reports_ground_truth_improvement() {
     let repaired_lsd = json["evaluation"]["repaired"]["lsd_hf"].as_f64().unwrap();
     let degraded_snr = json["evaluation"]["degraded"]["snr_db"].as_f64().unwrap();
     let repaired_snr = json["evaluation"]["repaired"]["snr_db"].as_f64().unwrap();
+    let degraded_hf_snr = json["evaluation"]["degraded"]["snr_hf_db"]
+        .as_f64()
+        .unwrap();
+    let repaired_hf_snr = json["evaluation"]["repaired"]["snr_hf_db"]
+        .as_f64()
+        .unwrap();
     assert!(repaired_lsd < degraded_lsd);
     assert!(repaired_snr > degraded_snr);
+    assert!(repaired_hf_snr > degraded_hf_snr);
     remove_if_exists(&input);
     remove_if_exists(&output);
     remove_if_exists(&report);

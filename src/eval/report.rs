@@ -46,9 +46,14 @@ pub fn print_summary(report: &Report) {
     if let Some(evaluation) = &report.evaluation {
         println!("- ground truth ------------------------------------");
         println!(
-            "lsd_hf {:8.4} -> {:8.4}    snr_db {} -> {}",
+            "lsd_hf {:8.4} -> {:8.4}    snr_hf {} -> {}",
             evaluation.degraded.lsd_hf,
             evaluation.repaired.lsd_hf,
+            display_optional(evaluation.degraded.snr_hf_db),
+            display_optional(evaluation.repaired.snr_hf_db)
+        );
+        println!(
+            "snr_db {} -> {}",
             display_optional(evaluation.degraded.snr_db),
             display_optional(evaluation.repaired.snr_db)
         );

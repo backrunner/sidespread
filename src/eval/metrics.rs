@@ -21,6 +21,7 @@ pub struct ProcessingMetrics {
 pub struct ReferenceMetrics {
     pub lsd_hf: f32,
     pub snr_db: Option<f32>,
+    pub snr_hf_db: Option<f32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -91,6 +92,44 @@ pub fn compare_reference(
     ReferenceMetrics {
         lsd_hf,
         snr_db: snr(reference, candidate),
+        snr_hf_db: spectral_snr(
+            &ref_spec,
+            &candidate_spec,
+            settings.fc_hz,
+            settings.n_fft,
+            settings.sample_rate,
+        ),
+    }
+}
+
+fn spectral_snr(
+    reference: &[SpectrumFrame],
+    candidate: &[SpectrumFrame],
+    fc_hz: usize,
+    n_fft: usize,
+    sample_rate: u32,
+) -> Option<f32> {
+    let n_bins = n_fft / 2 + 1;
+    let cutoff = bin_of(fc_hz as f32, n_fft, sample_rate).min(n_bins);
+    let frames = reference.len().min(candidate.len());
+    let mut signal = 0.0f64;
+    let mut noise = 0.0f64;
+    for frame in 0..frames {
+        for bin in cutoff..n_bins {
+            let reference_re = reference[frame].re(bin) as f64;
+            let reference_im = reference[frame].im(bin) as f64;
+            let error_re = reference_re - candidate[frame].re(bin) as f64;
+            let error_im = reference_im - candidate[frame].im(bin) as f64;
+            signal += reference_re * reference_re + reference_im * reference_im;
+            noise += error_re * error_re + error_im * error_im;
+        }
+    }
+    if signal <= 1e-12 {
+        None
+    } else if noise <= 1e-12 {
+        Some(f32::INFINITY)
+    } else {
+        Some((10.0 * (signal / noise).log10()) as f32)
     }
 }
 
@@ -360,5 +399,6 @@ mod tests {
         let repaired_metrics = compare_reference(&reference, &repaired, settings);
         assert!(repaired_metrics.lsd_hf < degraded_metrics.lsd_hf);
         assert!(repaired_metrics.snr_db > degraded_metrics.snr_db);
+        assert!(repaired_metrics.snr_hf_db > degraded_metrics.snr_hf_db);
     }
 }
