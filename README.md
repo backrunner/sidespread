@@ -1,8 +1,9 @@
 # Sidespread
 
 Sidespread repairs missing high-frequency detail in the side channel of stereo audio. Automatic
-mode applies fast DSP repair only where the intact spectrum provides strong evidence; uncertain and
-healthy audio is left alone. An experimental UniverSR neural route is available explicitly.
+mode applies fast DSP repair only where the spectrum around the cutoff provides strong evidence;
+uncertain and healthy audio is left alone. An experimental UniverSR neural route is available
+explicitly.
 
 ## Get Started
 
@@ -74,6 +75,15 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 ```
+
+On macOS, a stratified FMA-small recovery benchmark can be resumed with:
+
+```bash
+python3 scripts/benchmark_fma.py --dataset-root /path/to/fma
+```
+
+The dataset stays outside the repository. The script filters mono files and references with too
+little side energy above the tested cutoff, then reports HF-SNR regressions and repair coverage.
 
 ## Releases
 

@@ -109,3 +109,44 @@ neural repair remains available through explicit `--mode nn`.
 On this diagnostic set, conservative auto eliminated every observed HF-SNR regression while
 retaining useful DSP recovery on the correlated track. This is a safety improvement, not proof that
 the three-track set covers all music; a larger corpus remains necessary before raising coverage.
+
+## FMA-small Stratified Follow-up
+
+The larger follow-up uses FMA-small, a common music-information-retrieval dataset with 8000
+30-second tracks across eight balanced top-level genres. Each audio file retains its artist-selected
+Creative Commons license; no dataset audio is stored in this repository.
+
+The benchmark selected 25 valid stereo tracks per genre with seed `20260715`. Mono or invalid files
+were replaced from the same genre. A result was eligible only when the original side channel had at
+least `1e-4` of its STFT energy above the cutoff. This left 171 eligible tracks at 8 kHz and 94 at
+16 kHz; the lower 16 kHz count reflects the high-frequency limits of some source MP3 files.
+
+Automatic routing now requires all of the following, smoothed over nine overlapping segments:
+
+1. Complex M/S correlation of at least `0.35` in `[0.75 * fc, fc - 500 Hz]`.
+2. Complex M/S correlation of at least `0.40` in `[fc + 250 Hz, fc + 500 Hz]`.
+3. An S/M energy ratio of at least `1e-3` in that outer transition band.
+
+The transition energy condition prevents normalized correlation from looking confident when the
+remaining side signal is effectively numerical residue. A hard cutoff with no measurable evidence
+is intentionally skipped in automatic mode; forced DSP remains available explicitly.
+
+| Cutoff | Eligible | Repaired tracks | HF-SNR improved | HF-SNR regressed | Mean HF-SNR delta | Minimum delta | Mean LSD-HF delta |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 8 kHz | 171 | 60 | 21 | 0 | +0.102 dB | -0.034 dB | -0.908 dB |
+| 16 kHz | 94 | 38 | 15 | 0 | +0.058 dB | -0.042 dB | -0.544 dB |
+
+An improvement or regression means a change beyond `+/-0.05 dB` HF-SNR. Repair covered about 2.1%
+of deficient 8 kHz segments and 2.0% of deficient 16 kHz segments. The policy is deliberately
+conservative: it keeps only segments with observable evidence that mid high frequencies remain a
+useful predictor of the missing side information.
+
+The reproducible macOS benchmark command is:
+
+```bash
+python3 scripts/benchmark_fma.py \
+  --dataset-root /path/to/fma \
+  --per-genre 25 \
+  --thresholds 0.35 \
+  --transition-threshold 0.40
+```
