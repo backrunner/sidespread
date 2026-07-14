@@ -13,6 +13,10 @@ pub struct SegmentMetrics {
     pub lsd_hf: f32,
     /// High-frequency normalized cross-correlation between M and S magnitudes.
     pub corr_hf: f32,
+    /// S/M energy ratio in the intact band immediately below the cutoff.
+    pub r_intact: f32,
+    /// Complex M/S correlation in the intact band, used for route selection.
+    pub corr_intact: f32,
 }
 
 /// Report for one segment, including route decision.
@@ -39,7 +43,7 @@ pub fn analyze(
     let s_spec = stft(s_seg, &stft_cfg);
     let metrics = compute_metrics(&m_spec, &s_spec, cfg.fc, sample_rate, cfg.n_fft);
     let needs = metrics.r_hf < cfg.rhf_threshold;
-    let route = cfg.decide(needs, metrics.corr_hf);
+    let route = cfg.decide(needs, metrics.corr_intact);
     SegmentReport {
         start,
         end,
@@ -67,6 +71,17 @@ pub fn compute_metrics(
     let mut corr_num = 0.0f64;
     let mut corr_m_den = 0.0f64;
     let mut corr_s_den = 0.0f64;
+    let transition_hz = 500.0f32;
+    let intact_lo = bin_of((fc_hz as f32 * 0.5).max(500.0), n_fft, sample_rate).min(fc_bin);
+    let intact_hi = bin_of(
+        (fc_hz as f32 - transition_hz).max(500.0),
+        n_fft,
+        sample_rate,
+    )
+    .clamp(intact_lo.saturating_add(1), fc_bin.max(intact_lo + 1));
+    let mut intact_m_energy = 0.0f64;
+    let mut intact_s_energy = 0.0f64;
+    let mut intact_corr_num = 0.0f64;
 
     let frames = m_spec.len().min(s_spec.len());
     for f in 0..frames {
@@ -74,6 +89,15 @@ pub fn compute_metrics(
         let s_pow = power(&s_spec[f]);
         let m_log = log_power(&m_spec[f], 1e-10);
         let s_log = log_power(&s_spec[f], 1e-10);
+        for b in intact_lo..intact_hi {
+            let mr = m_spec[f].re(b) as f64;
+            let mi = m_spec[f].im(b) as f64;
+            let sr = s_spec[f].re(b) as f64;
+            let si = s_spec[f].im(b) as f64;
+            intact_m_energy += mr * mr + mi * mi;
+            intact_s_energy += sr * sr + si * si;
+            intact_corr_num += mr * sr + mi * si;
+        }
         let hf_bins = n_bins.saturating_sub(fc_bin).max(1);
         let m_mean = m_log[fc_bin..n_bins].iter().sum::<f32>() / hf_bins as f32;
         let s_mean = s_log[fc_bin..n_bins].iter().sum::<f32>() / hf_bins as f32;
@@ -115,11 +139,26 @@ pub fn compute_metrics(
             0.0
         }
     };
+    let r_intact = if intact_m_energy > 1e-12 {
+        (intact_s_energy / intact_m_energy) as f32
+    } else if intact_s_energy > 1e-12 {
+        1.0e6
+    } else {
+        1.0
+    };
+    let intact_denom = (intact_m_energy * intact_s_energy).sqrt();
+    let corr_intact = if intact_denom > 1e-12 {
+        (intact_corr_num / intact_denom) as f32
+    } else {
+        0.0
+    };
 
     SegmentMetrics {
         r_hf,
         lsd_hf,
         corr_hf,
+        r_intact,
+        corr_intact,
     }
 }
 
@@ -207,5 +246,27 @@ mod tests {
         assert!(report.metrics.r_hf >= 1.0e6);
         assert!(!report.needs_processing);
         assert_eq!(report.route, Route::Skip);
+    }
+
+    #[test]
+    fn intact_correlation_routes_missing_high_band_to_dsp() {
+        let sample_rate = 48_000;
+        let length = 8192;
+        let signal = |frequency: f32, index: usize| {
+            (2.0 * std::f32::consts::PI * frequency * index as f32 / sample_rate as f32).sin()
+        };
+        let mid = (0..length)
+            .map(|index| signal(6_000.0, index) * 0.25 + signal(12_000.0, index) * 0.2)
+            .collect::<Vec<_>>();
+        let side = (0..length)
+            .map(|index| signal(6_000.0, index) * 0.1)
+            .collect::<Vec<_>>();
+
+        let report = analyze(&mid, &side, 0, length, &Config::default(), sample_rate);
+
+        assert!(report.needs_processing);
+        assert!(report.metrics.corr_hf.abs() < 0.2);
+        assert!(report.metrics.corr_intact > 0.9);
+        assert_eq!(report.route, Route::Dsp);
     }
 }

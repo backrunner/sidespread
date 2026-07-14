@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Mode {
-    /// Automatically choose DSP or neural per segment based on detection.
+    /// Conservatively apply DSP only where intact-band evidence is strong.
     Auto,
     /// Force DSP route (mid→side HF folding) on every segment that needs repair.
     Dsp,
@@ -53,9 +53,9 @@ pub struct Config {
     pub fc: usize,
     /// R_hf below this → side HF deficient (default 0.3).
     pub rhf_threshold: f32,
-    /// corr_hf above this → mid and side similar → DSP route (default 0.6).
+    /// Smoothed intact-band correlation above this selects DSP (default 0.35).
     pub corr_high: f32,
-    /// corr_hf below this → mid and side independent → neural route (default 0.4).
+    /// Reserved lower correlation threshold (default 0.15).
     pub corr_low: f32,
     /// User-forced mode.
     pub mode: Mode,
@@ -78,8 +78,8 @@ impl Default for Config {
         Self {
             fc: 8000,
             rhf_threshold: 0.3,
-            corr_high: 0.6,
-            corr_low: 0.4,
+            corr_high: 0.35,
+            corr_low: 0.15,
             mode: Mode::Auto,
             ode_steps: 4,
             segment_ms: 80,
@@ -134,10 +134,8 @@ impl Config {
             Mode::Auto => {
                 if corr_hf >= self.corr_high {
                     Route::Dsp
-                } else if corr_hf <= self.corr_low {
-                    Route::Neural
                 } else {
-                    Route::Hybrid
+                    Route::Skip
                 }
             }
         }
@@ -177,5 +175,27 @@ impl Config {
             bail!("invalid STFT configuration");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_mode_skips_low_confidence_repairs() {
+        let config = Config::default();
+        assert_eq!(config.decide(true, 0.8), Route::Dsp);
+        assert_eq!(config.decide(true, 0.2), Route::Skip);
+        assert_eq!(config.decide(false, 0.8), Route::Skip);
+    }
+
+    #[test]
+    fn neural_mode_remains_available_explicitly() {
+        let config = Config {
+            mode: Mode::Nn,
+            ..Config::default()
+        };
+        assert_eq!(config.decide(true, -0.5), Route::Neural);
     }
 }

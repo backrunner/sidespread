@@ -35,7 +35,7 @@ pub enum Command {
             long,
             value_name = "HIGH,LOW",
             value_delimiter = ',',
-            default_value = "0.6,0.4"
+            default_value = "0.35,0.15"
         )]
         corr_threshold: Vec<f32>,
         #[arg(long, value_name = "STEPS", default_value_t = 4)]
@@ -57,7 +57,7 @@ pub enum Command {
             long,
             value_name = "HIGH,LOW",
             value_delimiter = ',',
-            default_value = "0.6,0.4"
+            default_value = "0.35,0.15"
         )]
         corr_threshold: Vec<f32>,
         #[arg(long, value_name = "PATH", default_value = "report.json")]
@@ -79,7 +79,7 @@ pub enum Command {
             long,
             value_name = "HIGH,LOW",
             value_delimiter = ',',
-            default_value = "0.6,0.4"
+            default_value = "0.35,0.15"
         )]
         corr_threshold: Vec<f32>,
         #[arg(long, value_name = "STEPS", default_value_t = 4)]

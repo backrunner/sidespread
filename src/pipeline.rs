@@ -47,6 +47,8 @@ pub fn info<P: AsRef<Path>>(input: P, fc: usize) -> Result<()> {
     println!("R_hf    : {:.4}", metrics.r_hf);
     println!("LSD_hf  : {:.4} dB", metrics.lsd_hf);
     println!("corr_hf : {:.4}", metrics.corr_hf);
+    println!("R_intact: {:.4}", metrics.r_intact);
+    println!("corr_int: {:.4}", metrics.corr_intact);
     if metrics.r_hf < config.rhf_threshold {
         println!("side HF appears deficient; run `sidespread process`.");
     } else {
@@ -211,7 +213,7 @@ fn analyze_all(
     config: &Config,
 ) -> (Vec<Segment>, Vec<SegmentReport>) {
     let ranges = segments(m.len(), sample_rate, config.segment_ms, config.overlap);
-    let reports = ranges
+    let mut reports = ranges
         .par_iter()
         .map(|segment| {
             analysis::analyze(
@@ -223,8 +225,33 @@ fn analyze_all(
                 sample_rate,
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
+    smooth_route_correlation(&mut reports, config, 9);
     (ranges, reports)
+}
+
+fn smooth_route_correlation(reports: &mut [SegmentReport], config: &Config, window: usize) {
+    if reports.is_empty() {
+        return;
+    }
+    let radius = window / 2;
+    let smoothed = reports
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let start = index.saturating_sub(radius);
+            let end = (index + radius + 1).min(reports.len());
+            reports[start..end]
+                .iter()
+                .map(|report| report.metrics.corr_intact)
+                .sum::<f32>()
+                / (end - start) as f32
+        })
+        .collect::<Vec<_>>();
+    for (report, correlation) in reports.iter_mut().zip(smoothed) {
+        report.metrics.corr_intact = correlation;
+        report.route = config.decide(report.needs_processing, correlation);
+    }
 }
 
 fn repair_segments(
@@ -410,6 +437,8 @@ mod tests {
                 r_hf: 0.0,
                 lsd_hf: 0.0,
                 corr_hf: 0.0,
+                r_intact: 0.0,
+                corr_intact: 0.0,
             },
         }
     }
