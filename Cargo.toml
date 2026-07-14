@@ -1,6 +1,6 @@
 [package]
 name = "sidespread"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Repair high-frequency loss in the side channel of AI-generated stereo music"
 license = "Apache-2.0"
