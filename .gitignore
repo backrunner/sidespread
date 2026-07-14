@@ -1,6 +1,7 @@
 # Rust build output
 /target/
 /dist/
+/benchmark-results/
 
 # Local Python/model tooling
 /.venv/
