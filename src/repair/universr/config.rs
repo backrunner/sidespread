@@ -3,7 +3,10 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+
+const EMBEDDED_CONFIG_JSON: &str = include_str!("../../../models/universr_config.json");
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UniversrConfig {
@@ -29,8 +32,14 @@ pub struct UniversrConfig {
 impl UniversrConfig {
     pub fn load(models_dir: &Path) -> Result<Self> {
         let path = models_dir.join("universr_config.json");
-        let s = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading universr config: {}", path.display()))?;
+        let s = match std::fs::read_to_string(&path) {
+            Ok(config) => config,
+            Err(error) if error.kind() == ErrorKind::NotFound => EMBEDDED_CONFIG_JSON.to_owned(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading universr config: {}", path.display()));
+            }
+        };
         let mut cfg: Self = serde_json::from_str(&s).context("parsing universr config")?;
         cfg.model_onnx = resolve_path(models_dir, &cfg.model_onnx);
         Ok(cfg)
@@ -53,5 +62,20 @@ fn resolve_path(models_dir: &Path, configured: &Path) -> PathBuf {
         configured.to_path_buf()
     } else {
         models_dir.join(configured)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_uses_embedded_config() {
+        let models_dir =
+            std::env::temp_dir().join(format!("sidespread-missing-models-{}", std::process::id()));
+        let config = UniversrConfig::load(&models_dir).unwrap();
+
+        assert_eq!(config.target_sr, 48_000);
+        assert_eq!(config.model_onnx, models_dir.join("universr_backbone.onnx"));
     }
 }
