@@ -89,3 +89,23 @@ information. HF-SNR must remain a release-gating metric. Before claiming accurat
 This is a diagnostic benchmark, not a statistically complete listening test. It covers three tracks,
 and neural measurements use two-second excerpts because CPU inference is roughly 40x slower than
 real time.
+
+## Conservative Auto Follow-up
+
+The router was changed to use correlation from the intact band below the cutoff, smoothed across
+nine overlapping segments (about 400 ms). The calibrated automatic threshold is 0.35. Automatic
+mode now applies DSP only above that confidence and leaves all other deficient segments unchanged;
+neural repair remains available through explicit `--mode nn`.
+
+| Cutoff | Track | HF-SNR before -> after | Result |
+|---|---|---:|---|
+| 8 kHz | Vibe Ace excerpt | 0.062 -> 0.062 dB | unchanged |
+| 8 kHz | Choice excerpt | 0.064 -> 2.590 dB | improved |
+| 8 kHz | Let's Go Fishin' excerpt | 0.075 -> 0.075 dB | unchanged |
+| 16 kHz | Vibe Ace full track | 0.268 -> 0.268 dB | unchanged |
+| 16 kHz | Choice full track | 0.489 -> 4.720 dB | improved |
+| 16 kHz | Let's Go Fishin' full track | 0.733 -> 0.733 dB | unchanged |
+
+On this diagnostic set, conservative auto eliminated every observed HF-SNR regression while
+retaining useful DSP recovery on the correlated track. This is a safety improvement, not proof that
+the three-track set covers all music; a larger corpus remains necessary before raising coverage.

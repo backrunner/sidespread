@@ -1,8 +1,8 @@
 # Sidespread
 
-Sidespread repairs missing high-frequency detail in the side channel of stereo audio. It first
-checks which parts of a track are affected, then uses either a fast DSP repair or an optional
-UniverSR neural model. Healthy audio is left alone.
+Sidespread repairs missing high-frequency detail in the side channel of stereo audio. Automatic
+mode applies fast DSP repair only where the intact spectrum provides strong evidence; uncertain and
+healthy audio is left alone. An experimental UniverSR neural route is available explicitly.
 
 ## Get Started
 
@@ -30,7 +30,7 @@ GitHub Releases and place the `sidespread` binary on your `PATH`.
 # Inspect a file without changing it
 sidespread detect song.wav
 
-# Detect and choose DSP, neural, or hybrid repair per segment
+# Detect and conservatively repair high-confidence segments
 sidespread process song.wav
 
 # Force the fast, model-free DSP route
@@ -55,7 +55,7 @@ R2 rather than GitHub storage. Download and verify the prebuilt model with:
 sidespread model download
 ```
 
-You can then use automatic routing or force neural repair:
+You can then explicitly run neural repair:
 
 ```bash
 sidespread process song.wav --mode nn
