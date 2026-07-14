@@ -10,6 +10,7 @@
 | [architecture.md](./architecture.md) | 架构与模块划分：顶层架构、目录结构、各模块职责、数据流、依赖 | 写代码前了解整体设计 |
 | [implementation_plan.md](./implementation_plan.md) | 实现方案：9 个阶段（P0-P8）的交付物、验证标准、风险与缓解、工时 | 制定 sprint / 落地代码前 |
 | [research_notes.md](./research_notes.md) | 调研结论：候选模型对比、FlashSR vs UniverSR benchmark、选型理由、文献空白 | 优化算法 / 更换模型 / 写论文时 |
+| [real_music_benchmark.md](./real_music_benchmark.md) | 三首真实音乐的 8/16 kHz side 高频恢复、HF-SNR 与路由诊断 | 调整检测、路由或修复算法前 |
 
 ## 一句话项目摘要
 
