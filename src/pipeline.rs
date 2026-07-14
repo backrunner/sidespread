@@ -49,6 +49,8 @@ pub fn info<P: AsRef<Path>>(input: P, fc: usize) -> Result<()> {
     println!("corr_hf : {:.4}", metrics.corr_hf);
     println!("R_intact: {:.4}", metrics.r_intact);
     println!("corr_int: {:.4}", metrics.corr_intact);
+    println!("R_trans : {:.6}", metrics.r_transition);
+    println!("corr_trn : {:.4}", metrics.corr_transition);
     if metrics.r_hf < config.rhf_threshold {
         println!("side HF appears deficient; run `sidespread process`.");
     } else {
@@ -97,9 +99,10 @@ pub fn process<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     let (m, s) = crate::io::mside::lr_to_ms(&buffer)?;
     let (segment_ranges, reports) = analyze_all(&m, &s, buffer.sample_rate, config);
     let needs_processing = reports.iter().any(|segment| segment.needs_processing);
+    let has_repair_route = reports.iter().any(|segment| segment.route != Route::Skip);
     let before = quality_for_side(&buffer, &m, &s, config);
 
-    if !needs_processing || config.mode == Mode::Skip {
+    if !needs_processing || config.mode == Mode::Skip || !has_repair_route {
         let report = Report {
             needs_processing,
             segments: reports,
@@ -112,7 +115,11 @@ pub fn process<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
         print_summary(&report);
         write_json(&report, report_path).context("writing report")?;
         if needs_processing {
-            eprintln!("repair skipped by --mode skip; no WAV was written.");
+            if config.mode == Mode::Skip {
+                eprintln!("repair skipped by --mode skip; no WAV was written.");
+            } else {
+                eprintln!("no segments met repair confidence; no WAV was written.");
+            }
         } else {
             eprintln!("audio does not need processing; only the report was written.");
         }
@@ -157,17 +164,15 @@ pub fn eval<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     ensure_nonempty(&buffer)?;
     config.validate(buffer.sample_rate)?;
     let (original_mid, original_side) = lr_to_ms(&buffer)?;
-    let synthesized_degraded_side =
+    let degraded_side =
         synthetic::degrade_side(&original_side, buffer.sample_rate, config.fc as f32);
-    let degraded_buffer = ms_to_lr(&original_mid, &synthesized_degraded_side, &buffer);
-    let (degraded_mid, degraded_side) = lr_to_ms(&degraded_buffer)?;
     let (segment_ranges, reports) =
-        analyze_all(&degraded_mid, &degraded_side, buffer.sample_rate, config);
+        analyze_all(&original_mid, &degraded_side, buffer.sample_rate, config);
     let repaired_side = if config.mode == Mode::Skip {
         degraded_side.clone()
     } else {
         repair_segments(
-            &degraded_mid,
+            &original_mid,
             &degraded_side,
             &segment_ranges,
             &reports,
@@ -175,7 +180,9 @@ pub fn eval<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
             buffer.sample_rate,
         )?
     };
-    let output_buffer = ms_to_lr(&degraded_mid, &repaired_side, &buffer);
+    let degraded_buffer = ms_to_lr(&original_mid, &degraded_side, &buffer);
+    let (written_degraded_mid, written_degraded_side) = lr_to_ms(&degraded_buffer)?;
+    let output_buffer = ms_to_lr(&original_mid, &repaired_side, &buffer);
     write_wav(output, &output_buffer).context("writing output wav")?;
     let written_buffer = read_wav(output).context("reading written output wav")?;
     let (written_mid, written_side) = lr_to_ms(&written_buffer)?;
@@ -184,13 +191,18 @@ pub fn eval<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
         needs_processing: reports.iter().any(|segment| segment.needs_processing),
         segments: reports,
         overall: Some(ProcessingMetrics {
-            before: quality_for_side(&degraded_buffer, &degraded_mid, &degraded_side, config),
+            before: quality_for_side(
+                &degraded_buffer,
+                &written_degraded_mid,
+                &written_degraded_side,
+                config,
+            ),
             after: quality_for_side(&written_buffer, &written_mid, &written_side, config),
         }),
         evaluation: Some(EvaluationMetrics {
             degraded: compare_reference(
                 &original_side,
-                &degraded_side,
+                &written_degraded_side,
                 metric_config(config, buffer.sample_rate),
             ),
             repaired: compare_reference(
@@ -241,16 +253,35 @@ fn smooth_route_correlation(reports: &mut [SegmentReport], config: &Config, wind
         .map(|(index, _)| {
             let start = index.saturating_sub(radius);
             let end = (index + radius + 1).min(reports.len());
-            reports[start..end]
+            let count = (end - start) as f32;
+            let intact = reports[start..end]
                 .iter()
                 .map(|report| report.metrics.corr_intact)
                 .sum::<f32>()
-                / (end - start) as f32
+                / count;
+            let transition = reports[start..end]
+                .iter()
+                .map(|report| report.metrics.corr_transition)
+                .sum::<f32>()
+                / count;
+            let transition_ratio = reports[start..end]
+                .iter()
+                .map(|report| report.metrics.r_transition)
+                .sum::<f32>()
+                / count;
+            (intact, transition, transition_ratio)
         })
         .collect::<Vec<_>>();
-    for (report, correlation) in reports.iter_mut().zip(smoothed) {
-        report.metrics.corr_intact = correlation;
-        report.route = config.decide(report.needs_processing, correlation);
+    for (report, (intact, transition, transition_ratio)) in reports.iter_mut().zip(smoothed) {
+        report.metrics.corr_intact = intact;
+        report.metrics.corr_transition = transition;
+        report.metrics.r_transition = transition_ratio;
+        report.route = config.decide(
+            report.needs_processing,
+            intact,
+            transition,
+            transition_ratio,
+        );
     }
 }
 
@@ -439,6 +470,8 @@ mod tests {
                 corr_hf: 0.0,
                 r_intact: 0.0,
                 corr_intact: 0.0,
+                corr_transition: 0.0,
+                r_transition: 0.0,
             },
         }
     }

@@ -61,6 +61,38 @@ fn healthy_process_writes_only_report() {
 }
 
 #[test]
+fn low_confidence_process_does_not_rewrite_audio() {
+    let input = temp_path("low-confidence-input", "wav");
+    let output = temp_path("low-confidence-output", "wav");
+    let report = temp_path("low-confidence-report", "json");
+    remove_if_exists(&output);
+    write_stereo(&input, 48_000, 48_000, |index| {
+        let time = index as f32 / 48_000.0;
+        let mid = 0.25 * (2.0 * std::f32::consts::PI * 10_000.0 * time).sin();
+        let side = 0.1 * (2.0 * std::f32::consts::PI * 1_000.0 * time + 0.7).sin();
+        (mid + side, mid - side)
+    });
+    let config = Config {
+        corr_high: 1.0,
+        ..Config::default()
+    };
+
+    pipeline::process(&input, &output, &config, &report).unwrap();
+
+    assert!(!output.exists());
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(json["needs_processing"], true);
+    assert!(json["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|segment| segment["route"] == "skip"));
+    remove_if_exists(&input);
+    remove_if_exists(&report);
+}
+
+#[test]
 fn short_tail_detect_is_safe() {
     let input = temp_path("short-tail-input", "wav");
     let report = temp_path("short-tail-report", "json");
@@ -169,6 +201,44 @@ fn eval_reports_ground_truth_improvement() {
     assert!(repaired_lsd < degraded_lsd);
     assert!(repaired_snr > degraded_snr);
     assert!(repaired_hf_snr > degraded_hf_snr);
+    remove_if_exists(&input);
+    remove_if_exists(&output);
+    remove_if_exists(&report);
+}
+
+#[test]
+fn skipped_eval_applies_the_limiter_only_once() {
+    let input = temp_path("eval-skip-input", "wav");
+    let output = temp_path("eval-skip-output", "wav");
+    let report = temp_path("eval-skip-report", "json");
+    write_stereo(&input, 48_000, 48_000, |index| {
+        let time = index as f32 / 48_000.0;
+        let mid = 0.8 * (2.0 * std::f32::consts::PI * 1_000.0 * time).sin()
+            + 0.15 * (2.0 * std::f32::consts::PI * 10_000.0 * time).sin();
+        let side = 0.12 * (2.0 * std::f32::consts::PI * 2_000.0 * time + 0.4).sin()
+            + 0.08 * (2.0 * std::f32::consts::PI * 10_000.0 * time + 0.4).sin();
+        (mid + side, mid - side)
+    });
+    let config = Config {
+        mode: Mode::Skip,
+        ..Config::default()
+    };
+
+    pipeline::eval(&input, &output, &config, &report).unwrap();
+
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    let degraded = json["evaluation"]["degraded"]["snr_hf_db"]
+        .as_f64()
+        .unwrap();
+    let repaired = json["evaluation"]["repaired"]["snr_hf_db"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (repaired - degraded).abs() < 0.02,
+        "skip changed HF-SNR by {} dB",
+        repaired - degraded
+    );
     remove_if_exists(&input);
     remove_if_exists(&output);
     remove_if_exists(&report);

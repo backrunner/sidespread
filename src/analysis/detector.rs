@@ -15,8 +15,12 @@ pub struct SegmentMetrics {
     pub corr_hf: f32,
     /// S/M energy ratio in the intact band immediately below the cutoff.
     pub r_intact: f32,
-    /// Complex M/S correlation in the intact band, used for route selection.
+    /// Complex M/S correlation in the near-cutoff intact band, used for route selection.
     pub corr_intact: f32,
+    /// Complex M/S correlation in the outer half of the cutoff transition.
+    pub corr_transition: f32,
+    /// S/M energy ratio in the outer half of the cutoff transition.
+    pub r_transition: f32,
 }
 
 /// Report for one segment, including route decision.
@@ -43,7 +47,12 @@ pub fn analyze(
     let s_spec = stft(s_seg, &stft_cfg);
     let metrics = compute_metrics(&m_spec, &s_spec, cfg.fc, sample_rate, cfg.n_fft);
     let needs = metrics.r_hf < cfg.rhf_threshold;
-    let route = cfg.decide(needs, metrics.corr_intact);
+    let route = cfg.decide(
+        needs,
+        metrics.corr_intact,
+        metrics.corr_transition,
+        metrics.r_transition,
+    );
     SegmentReport {
         start,
         end,
@@ -53,7 +62,7 @@ pub fn analyze(
     }
 }
 
-/// Compute the three metrics across aligned frames.
+/// Compute deficiency and routing evidence across aligned frames.
 pub fn compute_metrics(
     m_spec: &[SpectrumFrame],
     s_spec: &[SpectrumFrame],
@@ -72,16 +81,23 @@ pub fn compute_metrics(
     let mut corr_m_den = 0.0f64;
     let mut corr_s_den = 0.0f64;
     let transition_hz = 500.0f32;
-    let intact_lo = bin_of((fc_hz as f32 * 0.5).max(500.0), n_fft, sample_rate).min(fc_bin);
+    let intact_lo = bin_of((fc_hz as f32 * 0.75).max(500.0), n_fft, sample_rate).min(fc_bin);
     let intact_hi = bin_of(
         (fc_hz as f32 - transition_hz).max(500.0),
         n_fft,
         sample_rate,
     )
     .clamp(intact_lo.saturating_add(1), fc_bin.max(intact_lo + 1));
+    let transition_lo = bin_of(fc_hz as f32 + transition_hz * 0.5, n_fft, sample_rate).min(n_bins);
+    let transition_hi = bin_of(fc_hz as f32 + transition_hz, n_fft, sample_rate)
+        .min(n_bins)
+        .max(transition_lo);
     let mut intact_m_energy = 0.0f64;
     let mut intact_s_energy = 0.0f64;
     let mut intact_corr_num = 0.0f64;
+    let mut transition_m_energy = 0.0f64;
+    let mut transition_s_energy = 0.0f64;
+    let mut transition_corr_num = 0.0f64;
 
     let frames = m_spec.len().min(s_spec.len());
     for f in 0..frames {
@@ -89,6 +105,15 @@ pub fn compute_metrics(
         let s_pow = power(&s_spec[f]);
         let m_log = log_power(&m_spec[f], 1e-10);
         let s_log = log_power(&s_spec[f], 1e-10);
+        for b in transition_lo..transition_hi {
+            let mr = m_spec[f].re(b) as f64;
+            let mi = m_spec[f].im(b) as f64;
+            let sr = s_spec[f].re(b) as f64;
+            let si = s_spec[f].im(b) as f64;
+            transition_m_energy += mr * mr + mi * mi;
+            transition_s_energy += sr * sr + si * si;
+            transition_corr_num += mr * sr + mi * si;
+        }
         for b in intact_lo..intact_hi {
             let mr = m_spec[f].re(b) as f64;
             let mi = m_spec[f].im(b) as f64;
@@ -152,6 +177,19 @@ pub fn compute_metrics(
     } else {
         0.0
     };
+    let transition_denom = (transition_m_energy * transition_s_energy).sqrt();
+    let r_transition = if transition_m_energy > 1e-12 {
+        (transition_s_energy / transition_m_energy) as f32
+    } else if transition_s_energy > 1e-12 {
+        1.0e6
+    } else {
+        1.0
+    };
+    let corr_transition = if transition_denom > 1e-12 {
+        (transition_corr_num / transition_denom) as f32
+    } else {
+        0.0
+    };
 
     SegmentMetrics {
         r_hf,
@@ -159,6 +197,8 @@ pub fn compute_metrics(
         corr_hf,
         r_intact,
         corr_intact,
+        corr_transition,
+        r_transition,
     }
 }
 
@@ -249,24 +289,56 @@ mod tests {
     }
 
     #[test]
-    fn intact_correlation_routes_missing_high_band_to_dsp() {
+    fn correlated_transition_routes_missing_high_band_to_dsp() {
         let sample_rate = 48_000;
         let length = 8192;
         let signal = |frequency: f32, index: usize| {
             (2.0 * std::f32::consts::PI * frequency * index as f32 / sample_rate as f32).sin()
         };
         let mid = (0..length)
-            .map(|index| signal(6_000.0, index) * 0.25 + signal(12_000.0, index) * 0.2)
+            .map(|index| {
+                signal(6_000.0, index) * 0.25
+                    + signal(8_300.0, index) * 0.2
+                    + signal(12_000.0, index) * 0.2
+            })
             .collect::<Vec<_>>();
         let side = (0..length)
-            .map(|index| signal(6_000.0, index) * 0.1)
+            .map(|index| signal(6_000.0, index) * 0.1 + signal(8_300.0, index) * 0.02)
             .collect::<Vec<_>>();
 
         let report = analyze(&mid, &side, 0, length, &Config::default(), sample_rate);
 
         assert!(report.needs_processing);
-        assert!(report.metrics.corr_hf.abs() < 0.2);
         assert!(report.metrics.corr_intact > 0.9);
+        assert!(report.metrics.corr_transition > 0.9);
+        assert!(report.metrics.r_transition > Config::default().transition_rhf_min);
         assert_eq!(report.route, Route::Dsp);
+    }
+
+    #[test]
+    fn vanishing_transition_energy_skips_automatic_repair() {
+        let sample_rate = 48_000;
+        let length = 8192;
+        let signal = |frequency: f32, index: usize| {
+            (2.0 * std::f32::consts::PI * frequency * index as f32 / sample_rate as f32).sin()
+        };
+        let mid = (0..length)
+            .map(|index| {
+                signal(6_000.0, index) * 0.25
+                    + signal(8_300.0, index) * 0.2
+                    + signal(12_000.0, index) * 0.2
+            })
+            .collect::<Vec<_>>();
+        let side = (0..length)
+            .map(|index| signal(6_000.0, index) * 0.1 + signal(8_300.0, index) * 0.002)
+            .collect::<Vec<_>>();
+
+        let report = analyze(&mid, &side, 0, length, &Config::default(), sample_rate);
+
+        assert!(report.needs_processing);
+        assert!(report.metrics.corr_intact > 0.9);
+        assert!(report.metrics.corr_transition > 0.9);
+        assert!(report.metrics.r_transition < Config::default().transition_rhf_min);
+        assert_eq!(report.route, Route::Skip);
     }
 }

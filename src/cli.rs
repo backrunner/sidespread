@@ -33,9 +33,9 @@ pub enum Command {
         rhf_threshold: f32,
         #[arg(
             long,
-            value_name = "HIGH,LOW",
+            value_name = "INTACT,TRANSITION",
             value_delimiter = ',',
-            default_value = "0.35,0.15"
+            default_value = "0.35,0.40"
         )]
         corr_threshold: Vec<f32>,
         #[arg(long, value_name = "STEPS", default_value_t = 4)]
@@ -55,9 +55,9 @@ pub enum Command {
         rhf_threshold: f32,
         #[arg(
             long,
-            value_name = "HIGH,LOW",
+            value_name = "INTACT,TRANSITION",
             value_delimiter = ',',
-            default_value = "0.35,0.15"
+            default_value = "0.35,0.40"
         )]
         corr_threshold: Vec<f32>,
         #[arg(long, value_name = "PATH", default_value = "report.json")]
@@ -77,9 +77,9 @@ pub enum Command {
         rhf_threshold: f32,
         #[arg(
             long,
-            value_name = "HIGH,LOW",
+            value_name = "INTACT,TRANSITION",
             value_delimiter = ',',
-            default_value = "0.35,0.15"
+            default_value = "0.35,0.40"
         )]
         corr_threshold: Vec<f32>,
         #[arg(long, value_name = "STEPS", default_value_t = 4)]
@@ -205,7 +205,7 @@ fn parse_corr(v: &[f32]) -> Result<(f32, f32)> {
     match v {
         [hi, lo] => Ok((*hi, *lo)),
         [x] => Ok((*x, *x * 0.667)),
-        _ => anyhow::bail!("--corr-threshold expects 1 or 2 comma-separated values"),
+        _ => anyhow::bail!("--corr-threshold expects INTACT,TRANSITION"),
     }
 }
 

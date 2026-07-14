@@ -72,13 +72,15 @@ pub fn print_summary(report: &Report) {
     };
     for segment in shown {
         println!(
-            "[{:6}..{:6}] route={:<7} r_hf={:.3} lsd={:.3} corr_i={:.3}",
+            "[{:6}..{:6}] route={:<7} r_hf={:.3} lsd={:.3} corr_i={:.3} corr_t={:.3} r_t={:.4}",
             segment.start,
             segment.end,
             segment.route,
             segment.metrics.r_hf,
             segment.metrics.lsd_hf,
-            segment.metrics.corr_intact
+            segment.metrics.corr_intact,
+            segment.metrics.corr_transition,
+            segment.metrics.r_transition
         );
     }
     if total > 20 {

@@ -22,6 +22,8 @@ pub struct ReferenceMetrics {
     pub lsd_hf: f32,
     pub snr_db: Option<f32>,
     pub snr_hf_db: Option<f32>,
+    /// Fraction of the reference STFT energy at or above the configured cutoff.
+    pub reference_hf_ratio: Option<f32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -99,6 +101,40 @@ pub fn compare_reference(
             settings.n_fft,
             settings.sample_rate,
         ),
+        reference_hf_ratio: spectral_energy_ratio(
+            &ref_spec,
+            settings.fc_hz,
+            settings.n_fft,
+            settings.sample_rate,
+        ),
+    }
+}
+
+fn spectral_energy_ratio(
+    spectrum: &[SpectrumFrame],
+    fc_hz: usize,
+    n_fft: usize,
+    sample_rate: u32,
+) -> Option<f32> {
+    let n_bins = n_fft / 2 + 1;
+    let cutoff = bin_of(fc_hz as f32, n_fft, sample_rate).min(n_bins);
+    let mut total = 0.0f64;
+    let mut high = 0.0f64;
+    for frame in spectrum {
+        for bin in 0..n_bins.min(frame.n_bins) {
+            let re = frame.re(bin) as f64;
+            let im = frame.im(bin) as f64;
+            let energy = re * re + im * im;
+            total += energy;
+            if bin >= cutoff {
+                high += energy;
+            }
+        }
+    }
+    if total <= 1e-12 {
+        None
+    } else {
+        Some((high / total) as f32)
     }
 }
 
@@ -400,5 +436,10 @@ mod tests {
         assert!(repaired_metrics.lsd_hf < degraded_metrics.lsd_hf);
         assert!(repaired_metrics.snr_db > degraded_metrics.snr_db);
         assert!(repaired_metrics.snr_hf_db > degraded_metrics.snr_hf_db);
+        assert_eq!(
+            repaired_metrics.reference_hf_ratio,
+            degraded_metrics.reference_hf_ratio
+        );
+        assert!(degraded_metrics.reference_hf_ratio.unwrap() > 0.99);
     }
 }
