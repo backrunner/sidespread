@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
 import statistics
 import subprocess
@@ -56,6 +57,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--per-genre", type=int, default=25)
     parser.add_argument("--seed", type=int, default=20260715)
     parser.add_argument("--cutoffs", type=parse_int_list, default=[8000, 16000])
+    parser.add_argument(
+        "--mode",
+        choices=["auto", "dsp", "nn"],
+        default="auto",
+        help="processing strategy under evaluation",
+    )
+    parser.add_argument(
+        "--excerpt-seconds",
+        type=float,
+        help="benchmark only the centered excerpt of each decoded track",
+    )
+    parser.add_argument("--dsp-strength", type=float, default=2.0)
+    parser.add_argument("--dsp-phase-degrees", type=float, default=60.0)
+    parser.add_argument("--rhf-relative-threshold", type=float, default=0.18)
     parser.add_argument(
         "--thresholds",
         type=parse_float_list,
@@ -173,21 +188,48 @@ def convert_audio(source: Path, destination: Path) -> tuple[int, float]:
     return channels, duration
 
 
+def trim_centered_excerpt(path: Path, seconds: float) -> float:
+    with wave.open(str(path), "rb") as reader:
+        parameters = reader.getparams()
+        target_frames = min(reader.getnframes(), round(seconds * reader.getframerate()))
+        start = max(0, (reader.getnframes() - target_frames) // 2)
+        reader.setpos(start)
+        frames = reader.readframes(target_frames)
+    temporary = path.with_name(f"{path.stem}.excerpt{path.suffix}")
+    with wave.open(str(temporary), "wb") as writer:
+        writer.setparams(parameters)
+        writer.writeframes(frames)
+    temporary.replace(path)
+    return target_frames / parameters.framerate
+
+
 def result_key(
     track_id: int,
     cutoff: int,
     threshold: float,
     transition_threshold: float,
-) -> tuple[int, int, str, str]:
+    mode: str,
+    excerpt_seconds: float | None,
+    dsp_strength: float,
+    dsp_phase_degrees: float,
+    rhf_relative_threshold: float,
+) -> tuple[int, int, str, str, str, str, str, str, str]:
     return (
         track_id,
         cutoff,
         f"{threshold:.6f}",
         f"{transition_threshold:.6f}",
+        mode,
+        "full" if excerpt_seconds is None else f"{excerpt_seconds:.6f}",
+        f"{dsp_strength:.6f}",
+        f"{dsp_phase_degrees:.6f}",
+        f"{rhf_relative_threshold:.6f}",
     )
 
 
-def load_results(path: Path) -> dict[tuple[int, int, str, str], dict[str, Any]]:
+def load_results(
+    path: Path,
+) -> dict[tuple[int, int, str, str, str, str, str, str, str], dict[str, Any]]:
     results = {}
     if not path.exists():
         return results
@@ -202,6 +244,11 @@ def load_results(path: Path) -> dict[tuple[int, int, str, str], dict[str, Any]]:
                     int(row["cutoff_hz"]),
                     float(row["corr_threshold"]),
                     float(row.get("transition_threshold", 0.15)),
+                    str(row.get("mode", "auto")),
+                    row.get("excerpt_seconds"),
+                    float(row.get("dsp_strength", 1.0)),
+                    float(row.get("dsp_phase_degrees", 20.0)),
+                    float(row.get("rhf_relative_threshold", 0.2)),
                 )
                 results[key] = row
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -217,6 +264,10 @@ def run_evaluation(
     cutoff: int,
     threshold: float,
     transition_threshold: float,
+    mode: str,
+    dsp_strength: float,
+    dsp_phase_degrees: float,
+    rhf_relative_threshold: float,
     threads: int | None,
 ) -> dict[str, Any]:
     environment = None
@@ -234,11 +285,17 @@ def run_evaluation(
                 "--output",
                 str(repaired_wav),
                 "--mode",
-                "auto",
+                mode,
                 "--fc",
                 str(cutoff),
                 "--corr-threshold",
                 f"{threshold:.6f},{transition_threshold:.6f}",
+                "--dsp-strength",
+                f"{dsp_strength:.6f}",
+                "--dsp-phase-degrees",
+                f"{dsp_phase_degrees:.6f}",
+                "--rhf-relative-threshold",
+                f"{rhf_relative_threshold:.6f}",
                 "--report",
                 str(report_path),
             ],
@@ -255,19 +312,73 @@ def run_evaluation(
         return json.load(handle)
 
 
+def run_detection(
+    binary: Path,
+    clean_wav: Path,
+    report_path: Path,
+    cutoff: int,
+    threshold: float,
+    rhf_relative_threshold: float,
+    threads: int | None,
+) -> dict[str, Any]:
+    environment = None
+    if threads is not None:
+        import os
+
+        environment = os.environ.copy()
+        environment["RAYON_NUM_THREADS"] = str(threads)
+    try:
+        subprocess.run(
+            [
+                str(binary),
+                "detect",
+                str(clean_wav),
+                "--fc",
+                str(cutoff),
+                "--rhf-threshold",
+                f"{threshold:.6f}",
+                "--rhf-relative-threshold",
+                f"{rhf_relative_threshold:.6f}",
+                "--report",
+                str(report_path),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.strip() if error.stderr else str(error)
+        raise RuntimeError(f"Sidespread detection failed: {detail}") from error
+    with report_path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def make_row(
     track: Track,
     duration: float,
     cutoff: int,
     threshold: float,
     transition_threshold: float,
+    mode: str,
+    excerpt_seconds: float | None,
+    dsp_strength: float,
+    dsp_phase_degrees: float,
+    rhf_relative_threshold: float,
     report: dict[str, Any],
+    detection_report: dict[str, Any],
 ) -> dict[str, Any]:
     segments = report["segments"]
     deficient = sum(segment["needs_processing"] for segment in segments)
     dsp = sum(segment["route"] == "dsp" for segment in segments)
+    neural = sum(segment["route"] == "neural" for segment in segments)
+    hybrid = sum(segment["route"] == "hybrid" for segment in segments)
     degraded = report["evaluation"]["degraded"]
     repaired = report["evaluation"]["repaired"]
+    reference = report["evaluation"]["reference"]
+    overall = report["overall"]
+    clean_segments = detection_report["segments"]
     return {
         "track_id": track.track_id,
         "genre": track.genre,
@@ -278,14 +389,44 @@ def make_row(
         "cutoff_hz": cutoff,
         "corr_threshold": threshold,
         "transition_threshold": transition_threshold,
+        "mode": mode,
+        "excerpt_seconds": excerpt_seconds,
+        "dsp_strength": dsp_strength,
+        "dsp_phase_degrees": dsp_phase_degrees,
+        "rhf_relative_threshold": rhf_relative_threshold,
         "reference_hf_ratio": degraded["reference_hf_ratio"],
         "degraded_hf_snr_db": degraded["snr_hf_db"],
         "repaired_hf_snr_db": repaired["snr_hf_db"],
+        "degraded_preserved_snr_db": degraded["snr_preserved_db"],
+        "repaired_preserved_snr_db": repaired["snr_preserved_db"],
         "degraded_lsd_hf_db": degraded["lsd_hf"],
         "repaired_lsd_hf_db": repaired["lsd_hf"],
+        "existing_hf_projection_db": report["evaluation"][
+            "existing_hf_projection_db"
+        ],
+        "reference_r_hf": reference["r_hf"],
+        "reference_alignment_lsd_hf_db": reference["lsd_hf"],
+        "reference_mcd": reference["mcd"],
+        "reference_iccc_hf": reference["iccc_hf"],
+        "before_r_hf": overall["before"]["r_hf"],
+        "after_r_hf": overall["after"]["r_hf"],
+        "before_alignment_lsd_hf_db": overall["before"]["lsd_hf"],
+        "after_alignment_lsd_hf_db": overall["after"]["lsd_hf"],
+        "before_mcd": overall["before"]["mcd"],
+        "after_mcd": overall["after"]["mcd"],
+        "before_iccc_hf": overall["before"]["iccc_hf"],
+        "after_iccc_hf": overall["after"]["iccc_hf"],
+        "output_gain_db": overall["output_gain_db"],
+        "synthesis_mix": overall["synthesis_mix"],
         "total_segments": len(segments),
         "deficient_segments": deficient,
         "dsp_segments": dsp,
+        "neural_segments": neural,
+        "hybrid_segments": hybrid,
+        "clean_total_segments": len(clean_segments),
+        "clean_deficient_segments": sum(
+            segment["needs_processing"] for segment in clean_segments
+        ),
     }
 
 
@@ -305,6 +446,11 @@ def aggregate(
     cutoffs: list[int],
     thresholds: list[float],
     transition_threshold: float,
+    mode: str,
+    excerpt_seconds: float | None,
+    dsp_strength: float,
+    dsp_phase_degrees: float,
+    rhf_relative_threshold: float,
     min_hf_ratio: float,
     regression_tolerance: float,
 ) -> dict[str, Any]:
@@ -319,10 +465,15 @@ def aggregate(
             continue
         if float(key[2]) != transition_threshold:
             continue
-        ratio = row.get("reference_hf_ratio")
-        if ratio is None or ratio < min_hf_ratio:
+        if str(row.get("mode", "auto")) != mode:
             continue
-        if row.get("degraded_hf_snr_db") is None or row.get("repaired_hf_snr_db") is None:
+        if row.get("excerpt_seconds") != excerpt_seconds:
+            continue
+        if float(row.get("dsp_strength", 1.0)) != dsp_strength:
+            continue
+        if float(row.get("dsp_phase_degrees", 20.0)) != dsp_phase_degrees:
+            continue
+        if float(row.get("rhf_relative_threshold", 0.2)) != rhf_relative_threshold:
             continue
         groups[key].append(row)
 
@@ -332,20 +483,93 @@ def aggregate(
             selected = groups.get(
                 (cutoff, f"{threshold:.6f}", f"{transition_threshold:.6f}"), []
             )
+            reference_selected = [
+                row
+                for row in selected
+                if row.get("reference_hf_ratio") is not None
+                and row["reference_hf_ratio"] >= min_hf_ratio
+                and row.get("degraded_hf_snr_db") is not None
+                and row.get("repaired_hf_snr_db") is not None
+            ]
             deltas = [
                 row["repaired_hf_snr_db"] - row["degraded_hf_snr_db"]
-                for row in selected
+                for row in reference_selected
             ]
             lsd_deltas = [
                 row["repaired_lsd_hf_db"] - row["degraded_lsd_hf_db"]
+                for row in reference_selected
+            ]
+            repaired_tracks = sum(
+                row["dsp_segments"]
+                + row.get("neural_segments", 0)
+                + row.get("hybrid_segments", 0)
+                > 0
+                for row in selected
+            )
+            total_segments = sum(row["total_segments"] for row in selected)
+            deficient_segments = sum(row["deficient_segments"] for row in selected)
+            repaired_segments = sum(
+                row["dsp_segments"]
+                + row.get("neural_segments", 0)
+                + row.get("hybrid_segments", 0)
+                for row in selected
+            )
+            clean_segments = sum(row["clean_total_segments"] for row in selected)
+            clean_deficient_segments = sum(
+                row["clean_deficient_segments"] for row in selected
+            )
+            r_hf_gains = [
+                10.0
+                * math.log10(max(row["after_r_hf"], 1e-12) / max(row["before_r_hf"], 1e-12))
                 for row in selected
             ]
-            repaired_tracks = sum(row["dsp_segments"] > 0 for row in selected)
-            deficient_segments = sum(row["deficient_segments"] for row in selected)
-            dsp_segments = sum(row["dsp_segments"] for row in selected)
+            alignment_lsd_deltas = [
+                row["after_alignment_lsd_hf_db"] - row["before_alignment_lsd_hf_db"]
+                for row in selected
+            ]
+            mcd_deltas = [row["after_mcd"] - row["before_mcd"] for row in selected]
+            iccc_deltas = [
+                row["after_iccc_hf"] - row["before_iccc_hf"] for row in selected
+            ]
+            preserved_snrs = [
+                row["repaired_preserved_snr_db"]
+                for row in reference_selected
+                if row.get("degraded_preserved_snr_db") is not None
+                and row.get("repaired_preserved_snr_db") is not None
+                and math.isfinite(row["degraded_preserved_snr_db"])
+                and math.isfinite(row["repaired_preserved_snr_db"])
+            ]
+            reference_r_hf = [row["reference_r_hf"] for row in selected]
+            reference_lsd = [
+                row["reference_alignment_lsd_hf_db"] for row in selected
+            ]
+            reference_mcd = [row["reference_mcd"] for row in selected]
+            reference_iccc = [row["reference_iccc_hf"] for row in selected]
+            r_hf_log_errors = [
+                abs(
+                    10.0
+                    * math.log10(
+                        max(row["after_r_hf"], 1e-12)
+                        / max(row["reference_r_hf"], 1e-12)
+                    )
+                )
+                for row in selected
+            ]
+            iccc_errors = [
+                abs(row["after_iccc_hf"] - row["reference_iccc_hf"])
+                for row in selected
+            ]
+            output_gains = [row["output_gain_db"] for row in selected]
+            synthesis_mixes = [row["synthesis_mix"] for row in selected]
+            existing_hf_projections = [
+                row["existing_hf_projection_db"]
+                for row in selected
+                if row.get("existing_hf_projection_db") is not None
+                and math.isfinite(row["existing_hf_projection_db"])
+            ]
             genre_counts = defaultdict(int)
             genre_regressions = defaultdict(int)
-            for row, delta in zip(selected, deltas):
+            for row, delta in zip(reference_selected, deltas):
                 genre_counts[row["genre"]] += 1
                 if delta < -regression_tolerance:
                     genre_regressions[row["genre"]] += 1
@@ -354,7 +578,13 @@ def aggregate(
                     "cutoff_hz": cutoff,
                     "corr_threshold": threshold,
                     "transition_threshold": transition_threshold,
-                    "eligible_tracks": len(selected),
+                    "mode": mode,
+                    "excerpt_seconds": excerpt_seconds,
+                    "dsp_strength": dsp_strength,
+                    "dsp_phase_degrees": dsp_phase_degrees,
+                    "rhf_relative_threshold": rhf_relative_threshold,
+                    "total_tracks": len(selected),
+                    "eligible_tracks": len(reference_selected),
                     "repaired_tracks": repaired_tracks,
                     "improved_tracks": sum(delta > regression_tolerance for delta in deltas),
                     "regressed_tracks": sum(delta < -regression_tolerance for delta in deltas),
@@ -363,8 +593,116 @@ def aggregate(
                     "p10_hf_snr_delta_db": percentile(deltas, 0.10) if deltas else None,
                     "minimum_hf_snr_delta_db": min(deltas) if deltas else None,
                     "mean_lsd_hf_delta_db": statistics.fmean(lsd_deltas) if lsd_deltas else None,
-                    "repair_coverage": dsp_segments / deficient_segments
+                    "median_r_hf_gain_db": statistics.median(r_hf_gains)
+                    if r_hf_gains
+                    else None,
+                    "median_r_hf_before": statistics.median(
+                        row["before_r_hf"] for row in selected
+                    )
+                    if selected
+                    else None,
+                    "median_r_hf_after": statistics.median(
+                        row["after_r_hf"] for row in selected
+                    )
+                    if selected
+                    else None,
+                    "mean_alignment_lsd_delta_db": statistics.fmean(alignment_lsd_deltas)
+                    if alignment_lsd_deltas
+                    else None,
+                    "mean_mcd_delta": statistics.fmean(mcd_deltas) if mcd_deltas else None,
+                    "mean_iccc_hf_delta": statistics.fmean(iccc_deltas)
+                    if iccc_deltas
+                    else None,
+                    "minimum_repaired_preserved_snr_db": min(
+                        row["repaired_preserved_snr_db"]
+                        for row in reference_selected
+                        if row.get("repaired_preserved_snr_db") is not None
+                    )
+                    if any(
+                        row.get("repaired_preserved_snr_db") is not None
+                        for row in reference_selected
+                    )
+                    else None,
+                    "p10_repaired_preserved_snr_db": percentile(
+                        preserved_snrs, 0.10
+                    )
+                    if preserved_snrs
+                    else None,
+                    "median_repaired_preserved_snr_db": statistics.median(
+                        preserved_snrs
+                    )
+                    if preserved_snrs
+                    else None,
+                    "median_iccc_hf_after": statistics.median(
+                        row["after_iccc_hf"] for row in selected
+                    )
+                    if selected
+                    else None,
+                    "reference_r_hf_p10": percentile(reference_r_hf, 0.10)
+                    if reference_r_hf
+                    else None,
+                    "reference_r_hf_median": statistics.median(reference_r_hf)
+                    if reference_r_hf
+                    else None,
+                    "reference_r_hf_p90": percentile(reference_r_hf, 0.90)
+                    if reference_r_hf
+                    else None,
+                    "reference_lsd_hf_median_db": statistics.median(reference_lsd)
+                    if reference_lsd
+                    else None,
+                    "reference_mcd_median": statistics.median(reference_mcd)
+                    if reference_mcd
+                    else None,
+                    "reference_iccc_hf_p10": percentile(reference_iccc, 0.10)
+                    if reference_iccc
+                    else None,
+                    "reference_iccc_hf_median": statistics.median(reference_iccc)
+                    if reference_iccc
+                    else None,
+                    "reference_iccc_hf_p90": percentile(reference_iccc, 0.90)
+                    if reference_iccc
+                    else None,
+                    "median_r_hf_reference_error_db": statistics.median(r_hf_log_errors)
+                    if r_hf_log_errors
+                    else None,
+                    "median_iccc_hf_reference_error": statistics.median(iccc_errors)
+                    if iccc_errors
+                    else None,
+                    "median_output_gain_db": statistics.median(output_gains)
+                    if output_gains
+                    else None,
+                    "minimum_output_gain_db": min(output_gains) if output_gains else None,
+                    "median_synthesis_mix": statistics.median(synthesis_mixes)
+                    if synthesis_mixes
+                    else None,
+                    "minimum_synthesis_mix": min(synthesis_mixes)
+                    if synthesis_mixes
+                    else None,
+                    "minimum_existing_hf_projection_db": min(existing_hf_projections)
+                    if existing_hf_projections
+                    else None,
+                    "p10_existing_hf_projection_db": percentile(
+                        existing_hf_projections, 0.10
+                    )
+                    if existing_hf_projections
+                    else None,
+                    "median_existing_hf_projection_db": statistics.median(
+                        existing_hf_projections
+                    )
+                    if existing_hf_projections
+                    else None,
+                    "repair_coverage": repaired_segments / deficient_segments
                     if deficient_segments
+                    else 0.0,
+                    "synthetic_detection_rate": deficient_segments / total_segments
+                    if total_segments
+                    else 0.0,
+                    "clean_flagged_tracks": sum(
+                        row["clean_deficient_segments"] > 0 for row in selected
+                    ),
+                    "clean_segment_flag_rate": clean_deficient_segments
+                    / clean_segments
+                    if clean_segments
                     else 0.0,
                     "eligible_by_genre": dict(sorted(genre_counts.items())),
                     "regressions_by_genre": dict(sorted(genre_regressions.items())),
@@ -373,28 +711,40 @@ def aggregate(
     return {
         "min_reference_hf_ratio": min_hf_ratio,
         "regression_tolerance_db": regression_tolerance,
+        "mode": mode,
+        "excerpt_seconds": excerpt_seconds,
+        "dsp_strength": dsp_strength,
+        "dsp_phase_degrees": dsp_phase_degrees,
+        "rhf_relative_threshold": rhf_relative_threshold,
         "groups": summaries,
     }
 
 
 def print_summary(summary: dict[str, Any]) -> None:
     print(
-        "cutoff intact transition tracks repaired improved regressed "
-        "mean_delta median_delta p10_delta coverage"
+        "cutoff mode strength phase tracks repaired coverage r_hf_gain lsd_align mcd_delta "
+        "iccc_after r_hf_err iccc_err detect clean_flag retain gain_db synth safe_snr hf_snr_delta"
     )
     for row in summary["groups"]:
         mean = row["mean_hf_snr_delta_db"]
-        median = row["median_hf_snr_delta_db"]
-        p10 = row["p10_hf_snr_delta_db"]
         print(
-            f"{row['cutoff_hz']:6d} {row['corr_threshold']:6.2f} "
-            f"{row['transition_threshold']:10.2f} "
+            f"{row['cutoff_hz']:6d} {row['mode']:>4} "
+            f"{row['dsp_strength']:8.2f} {row['dsp_phase_degrees']:5.0f} "
             f"{row['eligible_tracks']:6d} {row['repaired_tracks']:8d} "
-            f"{row['improved_tracks']:8d} {row['regressed_tracks']:9d} "
-            f"{mean if mean is not None else float('nan'):10.3f} "
-            f"{median if median is not None else float('nan'):12.3f} "
-            f"{p10 if p10 is not None else float('nan'):9.3f} "
-            f"{row['repair_coverage']:8.3f}"
+            f"{row['repair_coverage']:8.3f} "
+            f"{row['median_r_hf_gain_db'] if row['median_r_hf_gain_db'] is not None else float('nan'):10.2f} "
+            f"{row['mean_alignment_lsd_delta_db'] if row['mean_alignment_lsd_delta_db'] is not None else float('nan'):9.2f} "
+            f"{row['mean_mcd_delta'] if row['mean_mcd_delta'] is not None else float('nan'):9.2f} "
+            f"{row['median_iccc_hf_after'] if row['median_iccc_hf_after'] is not None else float('nan'):10.3f} "
+            f"{row['median_r_hf_reference_error_db'] if row['median_r_hf_reference_error_db'] is not None else float('nan'):8.2f} "
+            f"{row['median_iccc_hf_reference_error'] if row['median_iccc_hf_reference_error'] is not None else float('nan'):8.3f} "
+            f"{row['synthetic_detection_rate']:6.3f} "
+            f"{row['clean_segment_flag_rate']:10.3f} "
+            f"{row['minimum_existing_hf_projection_db'] if row['minimum_existing_hf_projection_db'] is not None else float('nan'):6.2f} "
+            f"{row['median_output_gain_db'] if row['median_output_gain_db'] is not None else float('nan'):7.2f} "
+            f"{row['minimum_synthesis_mix'] if row['minimum_synthesis_mix'] is not None else float('nan'):5.2f} "
+            f"{row['minimum_repaired_preserved_snr_db'] if row['minimum_repaired_preserved_snr_db'] is not None else float('nan'):8.1f} "
+            f"{mean if mean is not None else float('nan'):12.3f}"
         )
 
 
@@ -404,6 +754,14 @@ def main() -> int:
         raise ValueError("--per-genre must be positive")
     if args.min_reference_hf_ratio < 0.0:
         raise ValueError("--min-reference-hf-ratio must be non-negative")
+    if args.excerpt_seconds is not None and args.excerpt_seconds <= 0.0:
+        raise ValueError("--excerpt-seconds must be positive")
+    if not 0.0 <= args.dsp_strength <= 3.0:
+        raise ValueError("--dsp-strength must be between 0 and 3")
+    if not 0.0 <= args.dsp_phase_degrees <= 180.0:
+        raise ValueError("--dsp-phase-degrees must be between 0 and 180")
+    if args.rhf_relative_threshold < 0.0:
+        raise ValueError("--rhf-relative-threshold must be non-negative")
     dataset_root = args.dataset_root.resolve()
     metadata_path = dataset_root / "fma_metadata" / "tracks.csv"
     binary = args.binary.resolve()
@@ -439,6 +797,11 @@ def main() -> int:
                         cutoff,
                         threshold,
                         args.transition_threshold,
+                        args.mode,
+                        args.excerpt_seconds,
+                        args.dsp_strength,
+                        args.dsp_phase_degrees,
+                        args.rhf_relative_threshold,
                     )
                     not in results
                 ]
@@ -450,10 +813,13 @@ def main() -> int:
                 clean_wav = temporary_path / "clean.wav"
                 repaired_wav = temporary_path / "repaired.wav"
                 report_path = temporary_path / "report.json"
+                detection_report_path = temporary_path / "detection-report.json"
                 try:
                     if not source.is_file():
                         raise FileNotFoundError(source)
                     channels, duration = convert_audio(source, clean_wav)
+                    if args.excerpt_seconds is not None:
+                        duration = trim_centered_excerpt(clean_wav, args.excerpt_seconds)
                     if channels != 2:
                         raise ValueError(f"expected stereo audio, found {channels} channel(s)")
                     if duration < 1.0:
@@ -464,6 +830,15 @@ def main() -> int:
                         flush=True,
                     )
                     for cutoff, threshold in pending:
+                        detection_report = run_detection(
+                            binary,
+                            clean_wav,
+                            detection_report_path,
+                            cutoff,
+                            threshold,
+                            args.rhf_relative_threshold,
+                            args.threads,
+                        )
                         report = run_evaluation(
                             binary,
                             clean_wav,
@@ -472,6 +847,10 @@ def main() -> int:
                             cutoff,
                             threshold,
                             args.transition_threshold,
+                            args.mode,
+                            args.dsp_strength,
+                            args.dsp_phase_degrees,
+                            args.rhf_relative_threshold,
                             args.threads,
                         )
                         row = make_row(
@@ -480,7 +859,13 @@ def main() -> int:
                             cutoff,
                             threshold,
                             args.transition_threshold,
+                            args.mode,
+                            args.excerpt_seconds,
+                            args.dsp_strength,
+                            args.dsp_phase_degrees,
+                            args.rhf_relative_threshold,
                             report,
+                            detection_report,
                         )
                         with args.results.open("a", encoding="utf-8") as handle:
                             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -490,6 +875,11 @@ def main() -> int:
                                 cutoff,
                                 threshold,
                                 args.transition_threshold,
+                                args.mode,
+                                args.excerpt_seconds,
+                                args.dsp_strength,
+                                args.dsp_phase_degrees,
+                                args.rhf_relative_threshold,
                             )
                         ] = row
                     selected.append(track)
@@ -510,6 +900,11 @@ def main() -> int:
         args.cutoffs,
         args.thresholds,
         args.transition_threshold,
+        args.mode,
+        args.excerpt_seconds,
+        args.dsp_strength,
+        args.dsp_phase_degrees,
+        args.rhf_relative_threshold,
         args.min_reference_hf_ratio,
         args.regression_tolerance_db,
     )
