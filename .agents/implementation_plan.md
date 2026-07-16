@@ -1,5 +1,7 @@
 # Sidespread — 实现方案与计划
 
+> 本文记录最初的分阶段实现方案。当前用户工作流与算法验收口径以 `requirements.md` 和 `real_music_benchmark.md` 为准；公开处理已收敛为单一的全缺损段 DSP 路线。
+
 ## 1. 实现阶段总览
 
 | 阶段 | 内容 | 工时 | 依赖 |

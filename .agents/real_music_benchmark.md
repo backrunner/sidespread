@@ -150,3 +150,53 @@ python3 scripts/benchmark_fma.py \
   --thresholds 0.35 \
   --transition-threshold 0.40
 ```
+
+## Perceptual-Enrichment Follow-up
+
+The product objective changed from near-zero ground-truth regression to useful reconstruction of a
+plausible side high band. Exact HF-SNR remains diagnostic, but it no longer suppresses synthesis:
+the original missing phase and content cannot be inferred from the degraded input.
+
+A 40-track stratified FMA-small sweep first replaced the missing band, then moved to an additive
+energy-deficit design so existing Side bins are never overwritten. Additive strengths from `1.0` to
+`2.5`, phase diffusion from 60 to 120 degrees, and relative detection thresholds from `0.15` to
+`0.40` were compared. Strength `2.0`, 60-degree diffusion, and a `0.18` relative threshold provided
+the best joint energy, spatial-correlation, reference-match, and clean-control result. The output
+uses a fixed common gain when headroom is needed; attenuation is capped at 3 dB before reducing only
+the synthesized side delta.
+
+| Metric | Tuned DSP result |
+|---|---:|
+| Synthetic degraded-segment detection | 88.08% |
+| Repair coverage after detection | 100% |
+| Clean-control segment flag rate | 3.63% |
+| Median repaired/reference R_hf error | 3.06 dB |
+| Median repaired/reference ICCC error | 0.076 |
+| Mean M/S alignment LSD change | -42.62 dB |
+| Mean MCD change | -1007.62 |
+| Minimum existing-HF projection | +0.93 dB |
+| Minimum protected-band level-matched SNR | 34.29 dB |
+| Median output gain | -0.03 dB |
+| Minimum output gain | -3.00 dB |
+| Minimum retained synthesis mix | 20.28% |
+| Mean ground-truth HF-SNR change | -2.57 dB |
+
+The protected band ends 500 Hz below the cutoff so that the intentional crossfade is not
+misclassified as low-band damage. Of 40 tracks, 32 retained the complete synthesized signal; eight
+needed some headroom reduction. The minimum synthesis mix reflects a deliberately over-complete raw
+delta at strength 2.0; the original Side spectrum remains present even when that delta is reduced.
+
+An eight-genre, one-second-per-track comparison used the same excerpts for tuned DSP and UniverSR:
+
+| Metric | DSP | UniverSR |
+|---|---:|---:|
+| Median repaired/reference R_hf error | 2.53 dB | 7.49 dB |
+| Median repaired/reference ICCC error | 0.098 | 0.607 |
+| Mean M/S alignment LSD change | -48.23 dB | -41.57 dB |
+| Mean MCD change | -1152.95 | -1039.53 |
+| Mean ground-truth HF-SNR change | -2.26 dB | -7.76 dB |
+
+DSP completed the eight excerpt jobs, including decode and report overhead, in about four seconds.
+UniverSR took roughly a minute per one-second excerpt on CPU and produced excessive energy or width
+on several styles. The public workflow therefore uses tuned DSP for every deficient segment. The
+neural backend remains available only for research evaluation.
