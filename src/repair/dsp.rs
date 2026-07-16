@@ -2,9 +2,9 @@
 //!
 //! Strategy (per segment):
 //! 1. STFT both M and S.
-//! 2. For bins above fc, replace S magnitude with M magnitude scaled by a per-bin gain
-//!    estimated from S's midband energy relative to M's highband energy.
-//! 3. Use M's phase plus a small smooth jitter to avoid fully-coherent artifacts.
+//! 2. For bins above fc, preserve the original S complex value and add only the energy missing
+//!    from an M-derived target magnitude.
+//! 3. Use M's phase plus smooth diffusion, flipped when needed to avoid cancelling original S.
 //! 4. Crossfade with the original S in a transition band around fc.
 //! 5. iSTFT back to time domain.
 
@@ -48,26 +48,21 @@ pub fn repair(m_seg: &[f32], s_seg: &[f32], cfg: &Config, sample_rate: u32) -> V
     // Reconstruct modified S spectra.
     let frames = m_spec.len().min(s_spec.len());
     let mut new_spec: Vec<SpectrumFrame> = Vec::with_capacity(frames);
-    let jitter_rad = 20.0_f32.to_radians();
+    let jitter_rad = cfg.dsp_phase_degrees.to_radians();
 
     for f in 0..frames {
         let mut sf = SpectrumFrame::new(n_bins);
         for b in 0..n_bins {
-            let mask = band_mask(b, lo_bin, hi_bin);
+            let mask = band_mask(b, lo_bin, hi_bin) * cfg.dsp_strength;
             let m_mag = m_spec[f].mag(b);
             let m_phase = m_spec[f].phase(b);
             let s_re_orig = s_spec[f].re(b);
             let s_im_orig = s_spec[f].im(b);
 
-            // Repaired: M magnitude * gain, M phase + jitter.
-            let new_mag = m_mag * gain;
-            let new_phase = m_phase + phase_jitter(b, jitter_rad);
-            let new_re = new_mag * new_phase.cos();
-            let new_im = new_mag * new_phase.sin();
-
-            // Blend by mask: mask=0 → original S, mask=1 → repaired.
-            let re = s_re_orig * (1.0 - mask) + new_re * mask;
-            let im = s_im_orig * (1.0 - mask) + new_im * mask;
+            let target_mag = m_mag * gain;
+            let synthesis_phase = m_phase + phase_jitter(b, jitter_rad);
+            let (re, im) =
+                fill_energy_deficit(s_re_orig, s_im_orig, target_mag, synthesis_phase, mask);
             sf.cplx[2 * b] = re;
             sf.cplx[2 * b + 1] = im;
         }
@@ -75,6 +70,36 @@ pub fn repair(m_seg: &[f32], s_seg: &[f32], cfg: &Config, sample_rate: u32) -> V
     }
 
     istft(&new_spec, &stft_cfg, s_seg.len())
+}
+
+fn fill_energy_deficit(
+    original_re: f32,
+    original_im: f32,
+    target_magnitude: f32,
+    mut synthesis_phase: f32,
+    mix: f32,
+) -> (f32, f32) {
+    let original_power = original_re * original_re + original_im * original_im;
+    let target_power = target_magnitude * target_magnitude;
+    if target_power <= original_power || mix <= 0.0 {
+        return (original_re, original_im);
+    }
+
+    let mut unit_re = synthesis_phase.cos();
+    let mut unit_im = synthesis_phase.sin();
+    let mut projection = original_re * unit_re + original_im * unit_im;
+    if projection < 0.0 {
+        synthesis_phase += std::f32::consts::PI;
+        unit_re = synthesis_phase.cos();
+        unit_im = synthesis_phase.sin();
+        projection = -projection;
+    }
+    let discriminant = (projection * projection + target_power - original_power).max(0.0);
+    let added_magnitude = (-projection + discriminant.sqrt()).max(0.0) * mix;
+    (
+        original_re + added_magnitude * unit_re,
+        original_im + added_magnitude * unit_im,
+    )
 }
 
 #[cfg(test)]
@@ -90,5 +115,20 @@ mod tests {
         let out = repair(&m, &s, &cfg, 48000);
         assert_eq!(out.len(), s.len(), "repair must preserve segment length");
         assert!(out.iter().all(|&v| v.is_finite()));
+    }
+
+    #[test]
+    fn energy_fill_preserves_existing_complex_content() {
+        let original = (0.3f32, -0.4f32);
+        assert_eq!(
+            fill_energy_deficit(original.0, original.1, 0.4, 0.7, 1.0),
+            original
+        );
+
+        let repaired = fill_energy_deficit(original.0, original.1, 0.8, 2.9, 1.0);
+        let repaired_magnitude = (repaired.0 * repaired.0 + repaired.1 * repaired.1).sqrt();
+        let delta = (repaired.0 - original.0, repaired.1 - original.1);
+        assert!((repaired_magnitude - 0.8).abs() < 1e-5);
+        assert!(delta.0 * original.0 + delta.1 * original.1 >= -1e-6);
     }
 }

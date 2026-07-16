@@ -51,15 +51,21 @@ impl std::fmt::Display for Route {
 pub struct Config {
     /// High-frequency cutoff in Hz (default 8000).
     pub fc: usize,
-    /// R_hf below this → side HF deficient (default 0.3).
+    /// Absolute ceiling for the side/mid HF deficiency threshold (default 0.3).
     pub rhf_threshold: f32,
-    /// Smoothed intact-band correlation above this selects DSP (default 0.35).
+    /// Minimum high/intact side-energy ratio before a segment is considered deficient (0.18).
+    pub rhf_relative_threshold: f32,
+    /// Smoothed intact-band correlation above this selects DSP in evaluation auto mode.
     pub corr_high: f32,
     /// Smoothed outer-transition correlation required for DSP (default 0.40).
     pub corr_low: f32,
     /// Minimum smoothed S/M energy ratio in the outer cutoff transition.
     pub transition_rhf_min: f32,
-    /// User-forced mode.
+    /// Scale applied to the synthesized DSP energy deficit, in [0, 3].
+    pub dsp_strength: f32,
+    /// Maximum smooth phase diffusion applied to synthesized DSP bins.
+    pub dsp_phase_degrees: f32,
+    /// Internal processing strategy. The public process command always uses DSP.
     pub mode: Mode,
     /// ODE solver steps for the neural route (default 4).
     pub ode_steps: usize,
@@ -80,10 +86,13 @@ impl Default for Config {
         Self {
             fc: 8000,
             rhf_threshold: 0.3,
+            rhf_relative_threshold: 0.18,
             corr_high: 0.35,
             corr_low: 0.40,
             transition_rhf_min: 1.0e-3,
-            mode: Mode::Auto,
+            dsp_strength: 2.0,
+            dsp_phase_degrees: 60.0,
+            mode: Mode::Dsp,
             ode_steps: 4,
             segment_ms: 80,
             overlap: 0.5,
@@ -95,17 +104,24 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn from_detect(fc: usize, rhf_threshold: f32, (corr_high, corr_low): (f32, f32)) -> Self {
+    pub fn from_detect(fc: usize, rhf_threshold: f32) -> Self {
         Self {
             fc,
             rhf_threshold,
-            corr_high,
-            corr_low,
             ..Self::default()
         }
     }
 
-    pub fn from_process(
+    pub fn from_process(fc: usize, rhf_threshold: f32) -> Self {
+        Self {
+            fc,
+            rhf_threshold,
+            mode: Mode::Dsp,
+            ..Self::default()
+        }
+    }
+
+    pub fn from_evaluation(
         fc: usize,
         rhf_threshold: f32,
         (corr_high, corr_low): (f32, f32),
@@ -153,6 +169,13 @@ impl Config {
         }
     }
 
+    pub fn needs_repair(&self, r_hf: f32, r_intact: f32) -> bool {
+        let expected = self
+            .rhf_threshold
+            .min(r_intact.max(0.0) * self.rhf_relative_threshold);
+        r_hf < expected
+    }
+
     pub fn validate(&self, sample_rate: u32) -> Result<()> {
         if !matches!(sample_rate, 44_100 | 48_000) {
             bail!("unsupported sample rate {sample_rate} Hz; expected 44100 or 48000 Hz");
@@ -166,6 +189,9 @@ impl Config {
         if !self.rhf_threshold.is_finite() || self.rhf_threshold < 0.0 {
             bail!("--rhf-threshold must be a finite non-negative number");
         }
+        if !self.rhf_relative_threshold.is_finite() || self.rhf_relative_threshold < 0.0 {
+            bail!("relative HF threshold must be a finite non-negative number");
+        }
         if !self.corr_high.is_finite()
             || !self.corr_low.is_finite()
             || !(-1.0..=1.0).contains(&self.corr_high)
@@ -175,6 +201,12 @@ impl Config {
         }
         if !self.transition_rhf_min.is_finite() || self.transition_rhf_min < 0.0 {
             bail!("transition energy threshold must be finite and non-negative");
+        }
+        if !self.dsp_strength.is_finite() || !(0.0..=3.0).contains(&self.dsp_strength) {
+            bail!("DSP strength must be between 0 and 3");
+        }
+        if !self.dsp_phase_degrees.is_finite() || !(0.0..=180.0).contains(&self.dsp_phase_degrees) {
+            bail!("DSP phase diffusion must be between 0 and 180 degrees");
         }
         if self.ode_steps == 0 {
             bail!("--ode-steps must be at least 1");
@@ -198,12 +230,31 @@ mod tests {
 
     #[test]
     fn automatic_mode_skips_low_confidence_repairs() {
-        let config = Config::default();
+        let config = Config {
+            mode: Mode::Auto,
+            ..Config::default()
+        };
         assert_eq!(config.decide(true, 0.8, 0.4, 0.01), Route::Dsp);
         assert_eq!(config.decide(true, 0.2, 0.4, 0.01), Route::Skip);
         assert_eq!(config.decide(true, 0.8, 0.1, 0.01), Route::Skip);
         assert_eq!(config.decide(true, 0.8, 0.4, 1.0e-4), Route::Skip);
         assert_eq!(config.decide(false, 0.8, 0.4, 0.01), Route::Skip);
+    }
+
+    #[test]
+    fn default_mode_repairs_every_deficient_segment() {
+        let config = Config::default();
+        assert_eq!(config.decide(true, -1.0, -1.0, 0.0), Route::Dsp);
+        assert_eq!(config.decide(false, -1.0, -1.0, 0.0), Route::Skip);
+    }
+
+    #[test]
+    fn deficiency_is_relative_to_the_intact_side_band() {
+        let config = Config::default();
+        assert!(config.needs_repair(0.004, 0.15));
+        assert!(!config.needs_repair(0.10, 0.15));
+        assert!(!config.needs_repair(0.0, 0.0));
+        assert!(config.needs_repair(0.17, 1.0));
     }
 
     #[test]

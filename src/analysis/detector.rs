@@ -46,7 +46,7 @@ pub fn analyze(
     let m_spec = stft(m_seg, &stft_cfg);
     let s_spec = stft(s_seg, &stft_cfg);
     let metrics = compute_metrics(&m_spec, &s_spec, cfg.fc, sample_rate, cfg.n_fft);
-    let needs = metrics.r_hf < cfg.rhf_threshold;
+    let needs = cfg.needs_repair(metrics.r_hf, metrics.r_intact);
     let route = cfg.decide(
         needs,
         metrics.corr_intact,
@@ -306,7 +306,11 @@ mod tests {
             .map(|index| signal(6_000.0, index) * 0.1 + signal(8_300.0, index) * 0.02)
             .collect::<Vec<_>>();
 
-        let report = analyze(&mid, &side, 0, length, &Config::default(), sample_rate);
+        let config = Config {
+            mode: crate::config::Mode::Auto,
+            ..Config::default()
+        };
+        let report = analyze(&mid, &side, 0, length, &config, sample_rate);
 
         assert!(report.needs_processing);
         assert!(report.metrics.corr_intact > 0.9);
@@ -333,7 +337,11 @@ mod tests {
             .map(|index| signal(6_000.0, index) * 0.1 + signal(8_300.0, index) * 0.002)
             .collect::<Vec<_>>();
 
-        let report = analyze(&mid, &side, 0, length, &Config::default(), sample_rate);
+        let config = Config {
+            mode: crate::config::Mode::Auto,
+            ..Config::default()
+        };
+        let report = analyze(&mid, &side, 0, length, &config, sample_rate);
 
         assert!(report.needs_processing);
         assert!(report.metrics.corr_intact > 0.9);

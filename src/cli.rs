@@ -25,25 +25,12 @@ pub enum Command {
         input: PathBuf,
         #[arg(short, long, value_name = "OUTPUT")]
         output: Option<PathBuf>,
-        #[arg(long, value_enum, default_value_t = crate::config::Mode::Auto)]
-        mode: crate::config::Mode,
         #[arg(long, value_name = "HZ", default_value_t = 8000)]
         fc: usize,
         #[arg(long, value_name = "THRESH", default_value_t = 0.3)]
         rhf_threshold: f32,
-        #[arg(
-            long,
-            value_name = "INTACT,TRANSITION",
-            value_delimiter = ',',
-            default_value = "0.35,0.40"
-        )]
-        corr_threshold: Vec<f32>,
-        #[arg(long, value_name = "STEPS", default_value_t = 4)]
-        ode_steps: usize,
         #[arg(long, value_name = "PATH", default_value = "report.json")]
         report: PathBuf,
-        #[arg(long, value_name = "ONNX")]
-        model_path: Option<PathBuf>,
     },
     /// Detect only: report whether the audio needs processing and recommended route per segment.
     Detect {
@@ -53,17 +40,13 @@ pub enum Command {
         fc: usize,
         #[arg(long, value_name = "THRESH", default_value_t = 0.3)]
         rhf_threshold: f32,
-        #[arg(
-            long,
-            value_name = "INTACT,TRANSITION",
-            value_delimiter = ',',
-            default_value = "0.35,0.40"
-        )]
-        corr_threshold: Vec<f32>,
+        #[arg(long, hide = true, default_value_t = 0.18)]
+        rhf_relative_threshold: f32,
         #[arg(long, value_name = "PATH", default_value = "report.json")]
         report: PathBuf,
     },
     /// Evaluate on a synthetic degradation: clean → degrade side → repair → compare to original.
+    #[command(hide = true)]
     Eval {
         #[arg(value_name = "CLEAN")]
         clean: PathBuf,
@@ -75,6 +58,8 @@ pub enum Command {
         fc: usize,
         #[arg(long, value_name = "THRESH", default_value_t = 0.3)]
         rhf_threshold: f32,
+        #[arg(long, hide = true, default_value_t = 0.18)]
+        rhf_relative_threshold: f32,
         #[arg(
             long,
             value_name = "INTACT,TRANSITION",
@@ -88,6 +73,10 @@ pub enum Command {
         report: PathBuf,
         #[arg(long, value_name = "ONNX")]
         model_path: Option<PathBuf>,
+        #[arg(long, hide = true, default_value_t = 2.0)]
+        dsp_strength: f32,
+        #[arg(long, hide = true, default_value_t = 60.0)]
+        dsp_phase_degrees: f32,
     },
     /// Print WAV metadata and an M/S high-frequency energy overview.
     Info {
@@ -97,6 +86,7 @@ pub enum Command {
         fc: usize,
     },
     /// Download or verify the optional UniverSR model.
+    #[command(hide = true)]
     Model {
         #[command(subcommand)]
         command: ModelCommand,
@@ -137,32 +127,22 @@ pub fn run() -> Result<()> {
             input,
             fc,
             rhf_threshold,
-            corr_threshold,
+            rhf_relative_threshold,
             report,
         } => {
-            let cfg = Config::from_detect(fc, rhf_threshold, parse_corr(&corr_threshold)?);
+            let mut cfg = Config::from_detect(fc, rhf_threshold);
+            cfg.rhf_relative_threshold = rhf_relative_threshold;
             pipeline::detect(&input, &cfg, &report)
         }
         Command::Process {
             input,
             output,
-            mode,
             fc,
             rhf_threshold,
-            corr_threshold,
-            ode_steps,
             report,
-            model_path,
         } => {
             let out = output.unwrap_or_else(|| default_output_path(&input, ".repaired"));
-            let cfg = Config::from_process(
-                fc,
-                rhf_threshold,
-                parse_corr(&corr_threshold)?,
-                mode,
-                ode_steps,
-                model_path,
-            );
+            let cfg = Config::from_process(fc, rhf_threshold);
             pipeline::process(&input, &out, &cfg, &report)
         }
         Command::Eval {
@@ -171,13 +151,16 @@ pub fn run() -> Result<()> {
             mode,
             fc,
             rhf_threshold,
+            rhf_relative_threshold,
             corr_threshold,
             ode_steps,
             report,
             model_path,
+            dsp_strength,
+            dsp_phase_degrees,
         } => {
             let out = output.unwrap_or_else(|| default_output_path(&clean, ".eval_repaired"));
-            let cfg = Config::from_process(
+            let mut cfg = Config::from_evaluation(
                 fc,
                 rhf_threshold,
                 parse_corr(&corr_threshold)?,
@@ -185,6 +168,9 @@ pub fn run() -> Result<()> {
                 ode_steps,
                 model_path,
             );
+            cfg.dsp_strength = dsp_strength;
+            cfg.dsp_phase_degrees = dsp_phase_degrees;
+            cfg.rhf_relative_threshold = rhf_relative_threshold;
             pipeline::eval(&clean, &out, &cfg, &report)
         }
     }
@@ -219,6 +205,13 @@ mod tests {
         let output = default_output_path(input, ".repaired");
         assert_eq!(output, Path::new("/tmp/song.repaired.wav"));
         assert_ne!(output, input);
+    }
+
+    #[test]
+    fn process_does_not_expose_repair_modes() {
+        assert!(
+            Cli::try_parse_from(["sidespread", "process", "song.wav", "--mode", "nn"]).is_err()
+        );
     }
 
     #[test]

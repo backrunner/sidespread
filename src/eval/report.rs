@@ -41,10 +41,19 @@ pub fn print_summary(report: &Report) {
             "mcd   {:8.4} -> {:8.4}    iccc   {:8.4} -> {:8.4}",
             overall.before.mcd, overall.after.mcd, overall.before.iccc_hf, overall.after.iccc_hf
         );
+        println!(
+            "output gain: {:.2} dB    synthesis mix: {:.1}%",
+            overall.output_gain_db,
+            overall.synthesis_mix * 100.0
+        );
     }
 
     if let Some(evaluation) = &report.evaluation {
         println!("- ground truth ------------------------------------");
+        println!(
+            "reference r_hf={:.4} lsd_hf={:.4} iccc={:.4}",
+            evaluation.reference.r_hf, evaluation.reference.lsd_hf, evaluation.reference.iccc_hf
+        );
         println!(
             "lsd_hf {:8.4} -> {:8.4}    snr_hf {} -> {}",
             evaluation.degraded.lsd_hf,
@@ -53,9 +62,15 @@ pub fn print_summary(report: &Report) {
             display_optional(evaluation.repaired.snr_hf_db)
         );
         println!(
-            "snr_db {} -> {}",
+            "snr_db {} -> {}    snr_preserved {} -> {}",
             display_optional(evaluation.degraded.snr_db),
-            display_optional(evaluation.repaired.snr_db)
+            display_optional(evaluation.repaired.snr_db),
+            display_optional(evaluation.degraded.snr_preserved_db),
+            display_optional(evaluation.repaired.snr_preserved_db)
+        );
+        println!(
+            "existing HF projection: {} dB",
+            display_optional(evaluation.existing_hf_projection_db)
         );
     }
 

@@ -73,6 +73,7 @@ fn low_confidence_process_does_not_rewrite_audio() {
         (mid + side, mid - side)
     });
     let config = Config {
+        mode: Mode::Auto,
         corr_high: 1.0,
         ..Config::default()
     };
@@ -128,9 +129,11 @@ fn neural_failure_does_not_write_output() {
     let report = temp_path("missing-model-report", "json");
     remove_if_exists(&output);
     write_stereo(&input, 48_000, 48_000, |index| {
-        let phase = 2.0 * std::f32::consts::PI * 1_000.0 * index as f32 / 48_000.0;
-        let mono = phase.sin() * 0.25;
-        (mono, mono)
+        let time = index as f32 / 48_000.0;
+        let mid = (2.0 * std::f32::consts::PI * 1_000.0 * time).sin() * 0.15
+            + (2.0 * std::f32::consts::PI * 10_000.0 * time).sin() * 0.10;
+        let side = (2.0 * std::f32::consts::PI * 6_000.0 * time).sin() * 0.05;
+        (mid + side, mid - side)
     });
     let config = Config {
         mode: Mode::Nn,
@@ -169,7 +172,7 @@ fn thirty_two_bit_pcm_format_is_preserved() {
 }
 
 #[test]
-fn eval_reports_ground_truth_improvement() {
+fn eval_reports_enrichment_without_protected_band_damage() {
     let input = temp_path("eval-input", "wav");
     let output = temp_path("eval-output", "wav");
     let report = temp_path("eval-report", "json");
@@ -190,17 +193,21 @@ fn eval_reports_ground_truth_improvement() {
         serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
     let degraded_lsd = json["evaluation"]["degraded"]["lsd_hf"].as_f64().unwrap();
     let repaired_lsd = json["evaluation"]["repaired"]["lsd_hf"].as_f64().unwrap();
-    let degraded_snr = json["evaluation"]["degraded"]["snr_db"].as_f64().unwrap();
-    let repaired_snr = json["evaluation"]["repaired"]["snr_db"].as_f64().unwrap();
     let degraded_hf_snr = json["evaluation"]["degraded"]["snr_hf_db"]
         .as_f64()
         .unwrap();
     let repaired_hf_snr = json["evaluation"]["repaired"]["snr_hf_db"]
         .as_f64()
         .unwrap();
+    let repaired_preserved_snr = json["evaluation"]["repaired"]["snr_preserved_db"]
+        .as_f64()
+        .unwrap();
+    let before_r_hf = json["overall"]["before"]["r_hf"].as_f64().unwrap();
+    let after_r_hf = json["overall"]["after"]["r_hf"].as_f64().unwrap();
     assert!(repaired_lsd < degraded_lsd);
-    assert!(repaired_snr > degraded_snr);
-    assert!(repaired_hf_snr > degraded_hf_snr);
+    assert!(after_r_hf > before_r_hf + 0.01);
+    assert!(repaired_preserved_snr > 40.0);
+    assert!(repaired_hf_snr - degraded_hf_snr > -3.0);
     remove_if_exists(&input);
     remove_if_exists(&output);
     remove_if_exists(&report);

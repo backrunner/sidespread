@@ -48,7 +48,7 @@ pub fn ms_to_lr(m: &[f32], s: &[f32], template: &AudioBuffer) -> AudioBuffer {
 /// Soft clip with a narrow knee below full scale, bounded to [-1, 1].
 #[inline]
 pub fn soft_clip(x: f32) -> f32 {
-    const THRESH: f32 = 0.95;
+    const THRESH: f32 = 0.999;
     let ax = x.abs();
     if ax <= THRESH {
         return x;

@@ -5,7 +5,8 @@ use crate::analysis::segment::{segments, Segment};
 use crate::analysis::{self};
 use crate::config::{Config, Mode, Route};
 use crate::eval::metrics::{
-    compare_reference, quality_metrics, EvaluationMetrics, MetricConfig, ProcessingMetrics,
+    compare_reference, high_band_projection_db, quality_metrics, EvaluationMetrics, MetricConfig,
+    ProcessingMetrics,
 };
 use crate::eval::report::{print_summary, write_json, Report};
 use crate::eval::synthetic;
@@ -51,7 +52,7 @@ pub fn info<P: AsRef<Path>>(input: P, fc: usize) -> Result<()> {
     println!("corr_int: {:.4}", metrics.corr_intact);
     println!("R_trans : {:.6}", metrics.r_transition);
     println!("corr_trn : {:.4}", metrics.corr_transition);
-    if metrics.r_hf < config.rhf_threshold {
+    if config.needs_repair(metrics.r_hf, metrics.r_intact) {
         println!("side HF appears deficient; run `sidespread process`.");
     } else {
         println!("side HF looks healthy; no repair is likely needed.");
@@ -109,6 +110,8 @@ pub fn process<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
             overall: Some(ProcessingMetrics {
                 before: before.clone(),
                 after: before,
+                output_gain_db: 0.0,
+                synthesis_mix: 0.0,
             }),
             evaluation: None,
         };
@@ -134,7 +137,9 @@ pub fn process<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
         config,
         buffer.sample_rate,
     )?;
-    let output_buffer = ms_to_lr(&m, &repaired_side, &buffer);
+    let (output_mid, output_side, output_gain_db, synthesis_mix) =
+        fit_output_headroom(&m, &s, &repaired_side);
+    let output_buffer = ms_to_lr(&output_mid, &output_side, &buffer);
     write_wav(output, &output_buffer).context("writing output wav")?;
     let written_buffer = read_wav(output).context("reading written output wav")?;
     let (written_m, written_side) = lr_to_ms(&written_buffer)?;
@@ -143,7 +148,12 @@ pub fn process<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     let report = Report {
         needs_processing,
         segments: reports,
-        overall: Some(ProcessingMetrics { before, after }),
+        overall: Some(ProcessingMetrics {
+            before,
+            after,
+            output_gain_db,
+            synthesis_mix,
+        }),
         evaluation: None,
     };
     print_summary(&report);
@@ -164,15 +174,17 @@ pub fn eval<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     ensure_nonempty(&buffer)?;
     config.validate(buffer.sample_rate)?;
     let (original_mid, original_side) = lr_to_ms(&buffer)?;
-    let degraded_side =
+    let synthetic_degraded_side =
         synthetic::degrade_side(&original_side, buffer.sample_rate, config.fc as f32);
+    let degraded_buffer = ms_to_lr(&original_mid, &synthetic_degraded_side, &buffer);
+    let (degraded_mid, degraded_side) = lr_to_ms(&degraded_buffer)?;
     let (segment_ranges, reports) =
-        analyze_all(&original_mid, &degraded_side, buffer.sample_rate, config);
+        analyze_all(&degraded_mid, &degraded_side, buffer.sample_rate, config);
     let repaired_side = if config.mode == Mode::Skip {
         degraded_side.clone()
     } else {
         repair_segments(
-            &original_mid,
+            &degraded_mid,
             &degraded_side,
             &segment_ranges,
             &reports,
@@ -180,9 +192,9 @@ pub fn eval<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
             buffer.sample_rate,
         )?
     };
-    let degraded_buffer = ms_to_lr(&original_mid, &degraded_side, &buffer);
-    let (written_degraded_mid, written_degraded_side) = lr_to_ms(&degraded_buffer)?;
-    let output_buffer = ms_to_lr(&original_mid, &repaired_side, &buffer);
+    let (output_mid, output_side, output_gain_db, synthesis_mix) =
+        fit_output_headroom(&degraded_mid, &degraded_side, &repaired_side);
+    let output_buffer = ms_to_lr(&output_mid, &output_side, &buffer);
     write_wav(output, &output_buffer).context("writing output wav")?;
     let written_buffer = read_wav(output).context("reading written output wav")?;
     let (written_mid, written_side) = lr_to_ms(&written_buffer)?;
@@ -191,22 +203,25 @@ pub fn eval<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
         needs_processing: reports.iter().any(|segment| segment.needs_processing),
         segments: reports,
         overall: Some(ProcessingMetrics {
-            before: quality_for_side(
-                &degraded_buffer,
-                &written_degraded_mid,
-                &written_degraded_side,
-                config,
-            ),
+            before: quality_for_side(&degraded_buffer, &degraded_mid, &degraded_side, config),
             after: quality_for_side(&written_buffer, &written_mid, &written_side, config),
+            output_gain_db,
+            synthesis_mix,
         }),
         evaluation: Some(EvaluationMetrics {
+            reference: quality_for_side(&buffer, &original_mid, &original_side, config),
             degraded: compare_reference(
                 &original_side,
-                &written_degraded_side,
+                &degraded_side,
                 metric_config(config, buffer.sample_rate),
             ),
             repaired: compare_reference(
                 &original_side,
+                &written_side,
+                metric_config(config, buffer.sample_rate),
+            ),
+            existing_hf_projection_db: high_band_projection_db(
+                &degraded_side,
                 &written_side,
                 metric_config(config, buffer.sample_rate),
             ),
@@ -426,6 +441,65 @@ fn smoothstep(value: f32) -> f32 {
     value * value * (3.0 - 2.0 * value)
 }
 
+/// Preserve the complete repair when possible. For unusually hot masters, cap fixed output
+/// attenuation at 3 dB and reduce only the synthesized side delta enough to avoid clipping.
+fn fit_output_headroom(
+    mid: &[f32],
+    original_side: &[f32],
+    repaired_side: &[f32],
+) -> (Vec<f32>, Vec<f32>, f32, f32) {
+    const PEAK_LIMIT: f32 = 0.998;
+    const MIN_OUTPUT_GAIN_DB: f32 = -3.0;
+    let length = mid.len().min(original_side.len()).min(repaired_side.len());
+    let peak_for_mix = |mix: f32| {
+        (0..length).fold(0.0f32, |peak, index| {
+            let side = original_side[index] + mix * (repaired_side[index] - original_side[index]);
+            peak.max((mid[index] + side).abs())
+                .max((mid[index] - side).abs())
+        })
+    };
+    let full_peak = peak_for_mix(1.0);
+    let full_gain = if full_peak > PEAK_LIMIT {
+        PEAK_LIMIT / full_peak
+    } else {
+        1.0
+    };
+    let minimum_gain = 10.0f32.powf(MIN_OUTPUT_GAIN_DB / 20.0);
+    let (gain, synthesis_mix) = if full_gain >= minimum_gain {
+        (full_gain, 1.0)
+    } else {
+        let original_peak = peak_for_mix(0.0);
+        let gain = minimum_gain.min(if original_peak > PEAK_LIMIT {
+            PEAK_LIMIT / original_peak
+        } else {
+            1.0
+        });
+        let allowed_peak = PEAK_LIMIT / gain;
+        let mut low = 0.0f32;
+        let mut high = 1.0f32;
+        for _ in 0..24 {
+            let middle = (low + high) * 0.5;
+            if peak_for_mix(middle) <= allowed_peak {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        (gain, low)
+    };
+    let output_gain_db = 20.0 * gain.log10();
+    (
+        mid[..length].iter().map(|sample| sample * gain).collect(),
+        original_side[..length]
+            .iter()
+            .zip(&repaired_side[..length])
+            .map(|(original, repaired)| gain * (original + synthesis_mix * (repaired - original)))
+            .collect(),
+        output_gain_db,
+        synthesis_mix,
+    )
+}
+
 fn quality_for_side(
     buffer: &AudioBuffer,
     m: &[f32],
@@ -567,5 +641,48 @@ mod tests {
             loud_delta > quiet_delta * 3.0,
             "expected independent DSP gains, got quiet={quiet_delta}, loud={loud_delta}"
         );
+    }
+
+    #[test]
+    fn output_headroom_uses_one_transparent_gain() {
+        let mid = vec![0.8, 0.2, -0.7, 0.0];
+        let original_side = vec![0.0; 4];
+        let repaired_side = vec![0.6, -0.2, -0.7, 0.2];
+
+        let (limited_mid, limited_side, gain_db, synthesis_mix) =
+            fit_output_headroom(&mid, &original_side, &repaired_side);
+
+        let gain = 10.0f32.powf(gain_db / 20.0);
+        assert_eq!(synthesis_mix, 1.0);
+        for index in 0..mid.len() {
+            assert!((limited_mid[index] - mid[index] * gain).abs() < 1e-6);
+            assert!((limited_side[index] - repaired_side[index] * gain).abs() < 1e-6);
+            assert!((limited_mid[index] + limited_side[index]).abs() <= 0.998_001);
+            assert!((limited_mid[index] - limited_side[index]).abs() <= 0.998_001);
+        }
+
+        let (safe_mid, safe_side, safe_gain_db, safe_mix) =
+            fit_output_headroom(&vec![0.1; 256], &vec![0.0; 256], &vec![0.2; 256]);
+        assert_eq!(safe_mid, vec![0.1; 256]);
+        assert_eq!(safe_side, vec![0.2; 256]);
+        assert_eq!(safe_gain_db, 0.0);
+        assert_eq!(safe_mix, 1.0);
+    }
+
+    #[test]
+    fn output_headroom_caps_loudness_loss_before_reducing_synthesis() {
+        let mid = vec![0.95; 256];
+        let original_side = vec![0.0; 256];
+        let repaired_side = vec![0.95; 256];
+
+        let (limited_mid, limited_side, gain_db, synthesis_mix) =
+            fit_output_headroom(&mid, &original_side, &repaired_side);
+
+        assert!((gain_db - -3.0).abs() < 1e-5);
+        assert!(synthesis_mix > 0.0 && synthesis_mix < 1.0);
+        for (mid, side) in limited_mid.iter().zip(limited_side) {
+            assert!((mid + side).abs() <= 0.998_001);
+            assert!((mid - side).abs() <= 0.998_001);
+        }
     }
 }
