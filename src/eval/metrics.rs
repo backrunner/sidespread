@@ -17,7 +17,7 @@ pub struct ProcessingMetrics {
     pub after: QualityMetrics,
     /// Fixed gain applied to the complete repaired output to preserve peak headroom.
     pub output_gain_db: f32,
-    /// Fraction of the synthesized side delta retained after the loudness safety cap.
+    /// Fraction of all processed M/S deltas retained after the loudness safety cap.
     pub synthesis_mix: f32,
 }
 
@@ -43,7 +43,10 @@ pub struct EvaluationMetrics {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MetricConfig {
+    /// Start of the historical high-frequency quality band.
     pub fc_hz: usize,
+    /// Upper edge of the band that repair is expected to leave untouched.
+    pub protected_end_hz: usize,
     pub n_fft: usize,
     pub hop: usize,
     pub sample_rate: u32,
@@ -108,7 +111,7 @@ pub fn compare_reference(
             &candidate_spec,
             0,
             bin_of(
-                settings.fc_hz.saturating_sub(500) as f32,
+                settings.protected_end_hz as f32,
                 settings.n_fft,
                 settings.sample_rate,
             ),
@@ -520,6 +523,7 @@ mod tests {
         let signal = sine(10_000.0, 48_000, 8192);
         let settings = MetricConfig {
             fc_hz: 8000,
+            protected_end_hz: 7500,
             n_fft: 4096,
             hop: 1024,
             sample_rate: 48_000,
@@ -539,6 +543,7 @@ mod tests {
         let right = side.iter().map(|sample| -sample).collect::<Vec<_>>();
         let settings = MetricConfig {
             fc_hz: 8000,
+            protected_end_hz: 7500,
             n_fft: 4096,
             hop: 1024,
             sample_rate: 48_000,
@@ -558,6 +563,7 @@ mod tests {
             .collect::<Vec<_>>();
         let settings = MetricConfig {
             fc_hz: 8000,
+            protected_end_hz: 7500,
             n_fft: 4096,
             hop: 1024,
             sample_rate: 48_000,
@@ -581,6 +587,7 @@ mod tests {
             .collect::<Vec<_>>();
         let settings = MetricConfig {
             fc_hz: 8000,
+            protected_end_hz: 7500,
             n_fft: 4096,
             hop: 1024,
             sample_rate: 48_000,
@@ -595,5 +602,51 @@ mod tests {
             degraded_metrics.reference_hf_ratio
         );
         assert!(degraded_metrics.reference_hf_ratio.unwrap() > 0.99);
+    }
+
+    #[test]
+    fn preserved_snr_uses_its_own_band_edge() {
+        let sample_rate = 48_000;
+        let reference = (0..48_000)
+            .map(|index| {
+                let time = index as f32 / sample_rate as f32;
+                0.2 * (2.0 * std::f32::consts::PI * 3_000.0 * time).sin()
+                    + 0.2 * (2.0 * std::f32::consts::PI * 6_000.0 * time).sin()
+            })
+            .collect::<Vec<_>>();
+        let candidate = (0..48_000)
+            .map(|index| {
+                let time = index as f32 / sample_rate as f32;
+                0.2 * (2.0 * std::f32::consts::PI * 3_000.0 * time).sin()
+                    + 0.1 * (2.0 * std::f32::consts::PI * 6_000.0 * time).sin()
+            })
+            .collect::<Vec<_>>();
+        let base = MetricConfig {
+            fc_hz: 8_000,
+            protected_end_hz: 4_500,
+            n_fft: 4096,
+            hop: 1024,
+            sample_rate,
+        };
+        let allowed_repair = compare_reference(&reference, &candidate, base)
+            .snr_preserved_db
+            .unwrap();
+        let includes_repair = compare_reference(
+            &reference,
+            &candidate,
+            MetricConfig {
+                protected_end_hz: 7_500,
+                ..base
+            },
+        )
+        .snr_preserved_db
+        .unwrap();
+
+        assert!(allowed_repair >= 40.0, "protected SNR was {allowed_repair}");
+        assert!(
+            includes_repair < 20.0,
+            "wide-band SNR was {includes_repair}"
+        );
+        assert!(allowed_repair - includes_repair >= 25.0);
     }
 }

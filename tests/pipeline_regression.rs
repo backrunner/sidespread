@@ -1,5 +1,9 @@
+use sidespread::analysis::spectrum::bin_of;
+use sidespread::analysis::stft::{istft, stft, StftConfig};
 use sidespread::config::{Config, Mode};
-use sidespread::eval::metrics::{quality_metrics, MetricConfig};
+use sidespread::eval::metrics::{
+    compare_reference, high_band_projection_db, quality_metrics, MetricConfig,
+};
 use sidespread::io::{lr_to_ms, read_wav, write_wav};
 use sidespread::pipeline;
 use std::path::{Path, PathBuf};
@@ -38,6 +42,26 @@ where
     writer.finalize().unwrap();
 }
 
+fn brickwall_noise(length: usize, cutoff_hz: f32, seed: u32) -> Vec<f32> {
+    let mut state = seed;
+    let noise = (0..length)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 16) as f32 / 32_768.0 - 1.0) * 0.15
+        })
+        .collect::<Vec<_>>();
+    let config = StftConfig::new(4096, 1024);
+    let mut spectrum = stft(&noise, &config);
+    let cutoff = bin_of(cutoff_hz, 4096, 48_000);
+    for frame in &mut spectrum {
+        for bin in cutoff..frame.n_bins {
+            frame.cplx[2 * bin] = 0.0;
+            frame.cplx[2 * bin + 1] = 0.0;
+        }
+    }
+    istft(&spectrum, &config, length)
+}
+
 #[test]
 fn healthy_process_writes_only_report() {
     let input = temp_path("healthy-input", "wav");
@@ -49,7 +73,7 @@ fn healthy_process_writes_only_report() {
         (phase.sin() * 0.25, phase.cos() * 0.25)
     });
 
-    pipeline::process(&input, &output, &Config::default(), &report).unwrap();
+    pipeline::process(&input, &output, &Config::default(), Some(report.as_path())).unwrap();
     assert!(!output.exists());
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
@@ -57,6 +81,145 @@ fn healthy_process_writes_only_report() {
     assert!(json["overall"]["before"]["mcd"].is_number());
 
     remove_if_exists(&input);
+    remove_if_exists(&report);
+}
+
+#[test]
+fn optional_artifact_repairs_process_healthy_audio_and_are_reported() {
+    let input = temp_path("artifact-input", "wav");
+    let output = temp_path("artifact-output", "wav");
+    let report = temp_path("artifact-report", "json");
+    remove_if_exists(&output);
+    write_stereo(&input, 48_000, 48_000, |index| {
+        let time = index as f32 / 48_000.0;
+        let carrier = (2.0 * std::f32::consts::PI * 10_000.0 * time).sin() * 0.16;
+        let overtone = (2.0 * std::f32::consts::PI * 13_000.0 * time).sin() * 0.05;
+        let phase = if (index / 8_000) % 2 == 0 { 0.4 } else { -1.2 };
+        let width = (2.0 * std::f32::consts::PI * 11_000.0 * time + phase).sin() * 0.05;
+        (carrier + overtone + width, carrier + overtone - width)
+    });
+    let config = Config {
+        repair_smearing: true,
+        smearing_strength: 0.4,
+        repair_bleeding: true,
+        bleeding_strength: 0.6,
+        stabilize_phase: true,
+        phase_strength: 0.8,
+        ..Config::default()
+    };
+
+    pipeline::process(&input, &output, &config, Some(report.as_path())).unwrap();
+
+    assert!(output.exists());
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(json["needs_processing"], true);
+    assert_eq!(json["artifact_processing"]["smearing"]["enabled"], true);
+    assert_eq!(
+        json["artifact_processing"]["harmonic_bleeding"]["strength"],
+        0.6
+    );
+    assert_eq!(
+        json["artifact_processing"]["phase_incoherence"]["strength"],
+        0.8
+    );
+    for processor in ["smearing", "harmonic_bleeding", "phase_incoherence"] {
+        let setting = &json["artifact_processing"][processor];
+        let requested = setting["strength"].as_f64().unwrap();
+        let applied = setting["applied_strength"].as_f64().unwrap();
+        assert!(applied > 0.0 && applied <= requested);
+    }
+    let before = &json["overall"]["before"];
+    let after = &json["overall"]["after"];
+    assert!(after["lsd_hf"].as_f64().unwrap() <= before["lsd_hf"].as_f64().unwrap());
+    assert!(after["mcd"].as_f64().unwrap() <= before["mcd"].as_f64().unwrap());
+    assert!(after["iccc_hf"].as_f64().unwrap() >= before["iccc_hf"].as_f64().unwrap());
+
+    remove_if_exists(&input);
+    remove_if_exists(&output);
+    remove_if_exists(&report);
+}
+
+#[test]
+fn zero_strength_artifact_switches_remain_a_pipeline_bypass() {
+    let input = temp_path("artifact-zero-input", "wav");
+    let output = temp_path("artifact-zero-output", "wav");
+    remove_if_exists(&output);
+    write_stereo(&input, 48_000, 48_000, |index| {
+        let phase = 2.0 * std::f32::consts::PI * 10_000.0 * index as f32 / 48_000.0;
+        (phase.sin() * 0.25, phase.cos() * 0.25)
+    });
+    let config = Config {
+        repair_smearing: true,
+        smearing_strength: 0.0,
+        repair_bleeding: true,
+        bleeding_strength: 0.0,
+        stabilize_phase: true,
+        phase_strength: 0.0,
+        ..Config::default()
+    };
+
+    pipeline::process(&input, &output, &config, None).unwrap();
+    assert!(!output.exists());
+
+    remove_if_exists(&input);
+}
+
+#[test]
+fn fidelity_rejected_optional_repairs_do_not_write_audio() {
+    let input = temp_path("artifact-rejected-input", "wav");
+    let output = temp_path("artifact-rejected-output", "wav");
+    let report = temp_path("artifact-rejected-report", "json");
+    remove_if_exists(&output);
+    write_stereo(&input, 48_000, 48_000, |_| (0.0, 0.0));
+    let config = Config {
+        repair_smearing: true,
+        smearing_strength: 1.0,
+        repair_bleeding: true,
+        bleeding_strength: 1.0,
+        stabilize_phase: true,
+        phase_strength: 1.0,
+        ..Config::default()
+    };
+
+    pipeline::process(&input, &output, &config, Some(report.as_path())).unwrap();
+    assert!(!output.exists());
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    for processor in ["smearing", "harmonic_bleeding", "phase_incoherence"] {
+        assert_eq!(json["artifact_processing"][processor]["retained_mix"], 0.0);
+    }
+
+    remove_if_exists(&input);
+    remove_if_exists(&report);
+}
+
+#[test]
+fn shared_brickwall_cutoff_triggers_full_band_extension() {
+    let input = temp_path("brickwall-input", "wav");
+    let output = temp_path("brickwall-output", "wav");
+    let report = temp_path("brickwall-report", "json");
+    remove_if_exists(&output);
+    let mid = brickwall_noise(48_000, 14_000.0, 7);
+    let side = brickwall_noise(48_000, 14_000.0, 19)
+        .into_iter()
+        .map(|sample| sample * 0.4)
+        .collect::<Vec<_>>();
+    write_stereo(&input, 48_000, 48_000, |index| {
+        (mid[index] + side[index], mid[index] - side[index])
+    });
+
+    pipeline::process(&input, &output, &Config::default(), Some(report.as_path())).unwrap();
+
+    assert!(output.exists());
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(json["bandwidth"]["needs_extension"], true);
+    let cutoff = json["bandwidth"]["detected_cutoff_hz"].as_f64().unwrap();
+    assert!((cutoff - 14_000.0).abs() < 500.0, "cutoff={cutoff}");
+
+    remove_if_exists(&input);
+    remove_if_exists(&output);
     remove_if_exists(&report);
 }
 
@@ -78,12 +241,23 @@ fn low_confidence_process_does_not_rewrite_audio() {
         ..Config::default()
     };
 
-    pipeline::process(&input, &output, &config, &report).unwrap();
+    pipeline::process(&input, &output, &config, Some(report.as_path())).unwrap();
 
     assert!(!output.exists());
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
     assert_eq!(json["needs_processing"], true);
+    assert!(
+        json["missing_band_processing"]["detected_segments"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(json["missing_band_processing"]["routed_segments"], 0);
+    assert_eq!(
+        json["missing_band_processing"]["route_scope"],
+        "dynamic_side_missing_band_fill"
+    );
     assert!(json["segments"]
         .as_array()
         .unwrap()
@@ -101,7 +275,7 @@ fn short_tail_detect_is_safe() {
         let phase = 2.0 * std::f32::consts::PI * 1_000.0 * index as f32 / 48_000.0;
         (phase.sin() * 0.25, phase.sin() * 0.125)
     });
-    pipeline::detect(&input, &Config::default(), &report).unwrap();
+    pipeline::detect(&input, &Config::default(), Some(report.as_path())).unwrap();
     assert!(report.exists());
     remove_if_exists(&input);
     remove_if_exists(&report);
@@ -116,7 +290,7 @@ fn detect_supports_44100_hz() {
         let right_phase = 2.0 * std::f32::consts::PI * 11_000.0 * index as f32 / 44_100.0;
         (left_phase.sin() * 0.2, right_phase.sin() * 0.2)
     });
-    pipeline::detect(&input, &Config::default(), &report).unwrap();
+    pipeline::detect(&input, &Config::default(), Some(report.as_path())).unwrap();
     assert!(report.exists());
     remove_if_exists(&input);
     remove_if_exists(&report);
@@ -140,7 +314,7 @@ fn neural_failure_does_not_write_output() {
         model_path: Some(temp_path("missing-guided", "onnx")),
         ..Config::default()
     };
-    assert!(pipeline::process(&input, &output, &config, &report).is_err());
+    assert!(pipeline::process(&input, &output, &config, Some(report.as_path())).is_err());
     assert!(!output.exists());
     remove_if_exists(&input);
     remove_if_exists(&report);
@@ -188,7 +362,7 @@ fn eval_reports_enrichment_without_protected_band_damage() {
         mode: Mode::Dsp,
         ..Config::default()
     };
-    pipeline::eval(&input, &output, &config, &report).unwrap();
+    pipeline::eval(&input, &output, &config, Some(report.as_path())).unwrap();
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
     let degraded_lsd = json["evaluation"]["degraded"]["lsd_hf"].as_f64().unwrap();
@@ -231,7 +405,7 @@ fn skipped_eval_applies_the_limiter_only_once() {
         ..Config::default()
     };
 
-    pipeline::eval(&input, &output, &config, &report).unwrap();
+    pipeline::eval(&input, &output, &config, Some(report.as_path())).unwrap();
 
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
@@ -268,7 +442,7 @@ fn process_report_measures_the_written_waveform() {
         ..Config::default()
     };
 
-    pipeline::process(&input, &output, &config, &report).unwrap();
+    pipeline::process(&input, &output, &config, Some(report.as_path())).unwrap();
     let written = read_wav(&output).unwrap();
     assert!(
         written
@@ -287,6 +461,7 @@ fn process_report_measures_the_written_waveform() {
         right,
         MetricConfig {
             fc_hz: config.fc,
+            protected_end_hz: config.scan_start_hz.saturating_sub(500),
             n_fft: config.n_fft,
             hop: config.hop,
             sample_rate: written.sample_rate,
@@ -313,6 +488,48 @@ fn process_report_measures_the_written_waveform() {
 }
 
 #[test]
+#[ignore = "manual real-audio audit; set SIDESPREAD_AUDIT_INPUT and SIDESPREAD_AUDIT_OUTPUT"]
+fn audit_external_process_fidelity() {
+    let input = std::env::var("SIDESPREAD_AUDIT_INPUT").unwrap();
+    let output = std::env::var("SIDESPREAD_AUDIT_OUTPUT").unwrap();
+    let input = read_wav(input).unwrap();
+    let output = read_wav(output).unwrap();
+    assert_eq!(input.sample_rate, output.sample_rate);
+    assert_eq!(input.frames(), output.frames());
+    let settings = MetricConfig {
+        fc_hz: 8_000,
+        protected_end_hz: 4_500,
+        n_fft: 4096,
+        hop: 1024,
+        sample_rate: input.sample_rate,
+    };
+    let mut minimum_full_snr = f32::INFINITY;
+    let mut minimum_protected_snr = f32::INFINITY;
+    let mut minimum_hf_snr = f32::INFINITY;
+    let mut minimum_hf_projection = f32::INFINITY;
+    for (reference, candidate) in input.samples.iter().zip(&output.samples) {
+        let metrics = compare_reference(reference, candidate, settings);
+        minimum_full_snr = minimum_full_snr.min(metrics.snr_db.unwrap());
+        minimum_protected_snr = minimum_protected_snr.min(metrics.snr_preserved_db.unwrap());
+        minimum_hf_snr = minimum_hf_snr.min(metrics.snr_hf_db.unwrap());
+        minimum_hf_projection = minimum_hf_projection
+            .min(high_band_projection_db(reference, candidate, settings).unwrap());
+    }
+    let peak = output
+        .samples
+        .iter()
+        .flatten()
+        .map(|sample| sample.abs())
+        .fold(0.0f32, f32::max);
+    println!(
+        "PROCESS_FIDELITY full_snr_db={minimum_full_snr:.3} protected_snr_db={minimum_protected_snr:.3} hf_snr_db={minimum_hf_snr:.3} hf_projection_db={minimum_hf_projection:.3} peak={peak:.6}"
+    );
+    assert!(minimum_protected_snr >= 50.0);
+    assert!(minimum_hf_projection >= -0.5);
+    assert!(peak < 1.0);
+}
+
+#[test]
 fn dsp_only_processing_accepts_a_custom_cutoff() {
     let input = temp_path("custom-dsp-cutoff-input", "wav");
     let output = temp_path("custom-dsp-cutoff-output", "wav");
@@ -331,7 +548,7 @@ fn dsp_only_processing_accepts_a_custom_cutoff() {
         ..Config::default()
     };
 
-    pipeline::process(&input, &output, &config, &report).unwrap();
+    pipeline::process(&input, &output, &config, Some(report.as_path())).unwrap();
     assert!(output.exists());
 
     remove_if_exists(&input);

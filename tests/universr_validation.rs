@@ -414,3 +414,87 @@ fn istft_roundtrip_stability() {
     assert!(out.iter().all(|v| v.is_finite()));
     assert!(!out.is_empty());
 }
+
+#[test]
+#[ignore = "manual real-audio evaluation; set SIDESPREAD_UNIVERSR_WAV"]
+fn universr_real_audio_synthetic_evaluation() {
+    use sidespread::config::{Config, Mode};
+    use sidespread::io::{read_wav, write_wav, AudioBuffer};
+    use sidespread::pipeline;
+    use std::path::PathBuf;
+
+    let input = std::env::var("SIDESPREAD_UNIVERSR_WAV")
+        .expect("SIDESPREAD_UNIVERSR_WAV must point to a stereo WAV");
+    let model = std::env::var_os("SIDESPREAD_UNIVERSR_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("models/universr_backbone.onnx"));
+    let buffer = read_wav(input).unwrap();
+    let excerpt_len = buffer.sample_rate as usize;
+    assert!(buffer.frames() >= excerpt_len);
+    let start = (buffer.frames() - excerpt_len) / 2;
+    let excerpt = AudioBuffer {
+        samples: buffer
+            .samples
+            .iter()
+            .map(|channel| channel[start..start + excerpt_len].to_vec())
+            .collect(),
+        sample_rate: buffer.sample_rate,
+        bits_per_sample: buffer.bits_per_sample,
+        sample_format: buffer.sample_format,
+    };
+    let stem = format!("sidespread-universr-real-{}", std::process::id());
+    let excerpt_path = std::env::temp_dir().join(format!("{stem}-input.wav"));
+    let output_path = std::env::temp_dir().join(format!("{stem}-output.wav"));
+    let report_path = std::env::temp_dir().join(format!("{stem}-report.json"));
+    for path in [&excerpt_path, &output_path, &report_path] {
+        let _ = std::fs::remove_file(path);
+    }
+    write_wav(&excerpt_path, &excerpt).unwrap();
+
+    let mut config = Config::from_evaluation(8_000, 0.3, (0.35, 0.40), Mode::Nn, 4, Some(model));
+    config.overwrite_existing = true;
+    pipeline::eval(&excerpt_path, &output_path, &config, Some(&report_path)).unwrap();
+
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    let degraded = &report["evaluation"]["degraded"];
+    let repaired = &report["evaluation"]["repaired"];
+    println!(
+        "UNIVERSR_REAL lsd_hf={:.4}->{:.4} snr_hf={:.4}->{:.4} snr_preserved={:.4} projection_db={:.4}",
+        degraded["lsd_hf"].as_f64().unwrap(),
+        repaired["lsd_hf"].as_f64().unwrap(),
+        degraded["snr_hf_db"].as_f64().unwrap(),
+        repaired["snr_hf_db"].as_f64().unwrap(),
+        repaired["snr_preserved_db"].as_f64().unwrap(),
+        report["evaluation"]["existing_hf_projection_db"]
+            .as_f64()
+            .unwrap(),
+    );
+
+    for path in [&excerpt_path, &output_path, &report_path] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+#[ignore = "manual full-track neural processing; set SIDESPREAD_UNIVERSR_WAV and SIDESPREAD_UNIVERSR_OUTPUT"]
+fn universr_full_real_audio_process() {
+    use sidespread::config::{Config, Mode};
+    use sidespread::pipeline;
+    use std::path::PathBuf;
+
+    let input = PathBuf::from(
+        std::env::var_os("SIDESPREAD_UNIVERSR_WAV")
+            .expect("SIDESPREAD_UNIVERSR_WAV must point to a stereo WAV"),
+    );
+    let output = PathBuf::from(
+        std::env::var_os("SIDESPREAD_UNIVERSR_OUTPUT")
+            .expect("SIDESPREAD_UNIVERSR_OUTPUT must specify the output WAV"),
+    );
+    let model = std::env::var_os("SIDESPREAD_UNIVERSR_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("models/universr_backbone.onnx"));
+    let mut config = Config::from_evaluation(8_000, 0.3, (0.35, 0.40), Mode::Nn, 4, Some(model));
+    config.overwrite_existing = true;
+    pipeline::process(input, output, &config, None).unwrap();
+}

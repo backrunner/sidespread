@@ -1,5 +1,8 @@
 //! B route: targeted high-frequency repair with UniverSR ONNX.
 
+use crate::analysis::defects;
+use crate::analysis::spectrum::bin_of;
+use crate::analysis::stft::{istft, stft, SpectrumFrame, StftConfig};
 use crate::config::Config;
 use crate::repair::universr::config::UniversrConfig;
 use crate::repair::universr::frontend::Frontend;
@@ -19,6 +22,12 @@ pub struct NeuralState {
     solver: OdeSolver,
     chunk_samples: usize,
     cutoff_hz: usize,
+}
+
+pub struct GuardedNeuralAudio {
+    pub signal: Vec<f32>,
+    pub minimum_retained_mix: f32,
+    pub mean_retained_mix: f32,
 }
 
 impl NeuralState {
@@ -97,19 +106,50 @@ impl NeuralState {
     }
 
     pub fn repair_signal(&mut self, side: &[f32], sample_rate: u32) -> Result<Vec<f32>> {
+        self.repair_signal_with_progress(side, sample_rate, || {})
+    }
+
+    pub fn repair_signal_with_progress<F>(
+        &mut self,
+        side: &[f32],
+        sample_rate: u32,
+        on_chunk: F,
+    ) -> Result<Vec<f32>>
+    where
+        F: FnMut(),
+    {
         let at_target_rate = resample(side, sample_rate, self.config.target_sr)?;
-        let repaired = self.repair_48k(&at_target_rate)?;
+        let repaired = self.repair_48k(&at_target_rate, on_chunk)?;
         let mut output = resample(&repaired, self.config.target_sr, sample_rate)?;
         output.resize(side.len(), 0.0);
         output.truncate(side.len());
         Ok(output)
     }
 
-    fn repair_48k(&mut self, side: &[f32]) -> Result<Vec<f32>> {
+    pub fn chunk_count(&self, input_samples: usize, sample_rate: u32) -> usize {
+        if input_samples == 0 {
+            return 0;
+        }
+        let target_samples = (input_samples as f64 * self.config.target_sr as f64
+            / sample_rate.max(1) as f64)
+            .round() as usize;
+        if target_samples <= self.chunk_samples {
+            return 1;
+        }
+        let hop = (self.chunk_samples * 3 / 4).max(1);
+        1 + (target_samples - self.chunk_samples).div_ceil(hop)
+    }
+
+    fn repair_48k<F>(&mut self, side: &[f32], mut on_chunk: F) -> Result<Vec<f32>>
+    where
+        F: FnMut(),
+    {
         if side.is_empty() {
             return Ok(Vec::new());
         }
-        let hop = (self.chunk_samples / 2).max(1);
+        // A 250 ms overlap is ample for the model's one-second receptive field and avoids the
+        // previous 50% overlap's duplicate inference cost.
+        let hop = (self.chunk_samples * 3 / 4).max(1);
         let fade = self.chunk_samples - hop;
         let mut accumulated = vec![0.0f32; side.len()];
         let mut weights = vec![0.0f32; side.len()];
@@ -121,6 +161,7 @@ impl NeuralState {
             let mut chunk = vec![0.0f32; self.chunk_samples];
             chunk[..end - start].copy_from_slice(&side[start..end]);
             let repaired = self.repair_chunk(&chunk, 42u32.wrapping_add(chunk_index))?;
+            on_chunk();
             for local in 0..end - start {
                 let mut weight = 1.0f32;
                 if start > 0 && local < fade {
@@ -221,6 +262,231 @@ impl NeuralState {
 pub fn repair_signal(side: &[f32], config: &Config, sample_rate: u32) -> Result<Vec<f32>> {
     let mut state = NeuralState::from_config(config)?;
     state.repair_signal(side, sample_rate)
+}
+
+/// Keep UniverSR as a band-limited, non-cancelling delta and limit every frame against a local
+/// Side/Mid loudness estimate from the intact band below the repair cutoff.
+pub fn guard_candidate(
+    mid: &[f32],
+    original: &[f32],
+    candidate: &[f32],
+    config: &Config,
+    sample_rate: u32,
+) -> GuardedNeuralAudio {
+    guard_candidate_with_detection(mid, original, original, candidate, config, sample_rate)
+}
+
+pub(crate) fn guard_candidate_with_detection(
+    mid: &[f32],
+    original: &[f32],
+    detection_side: &[f32],
+    candidate: &[f32],
+    config: &Config,
+    sample_rate: u32,
+) -> GuardedNeuralAudio {
+    if mid.len() != original.len()
+        || detection_side.len() != original.len()
+        || candidate.len() != original.len()
+        || original.is_empty()
+        || !candidate.iter().all(|sample| sample.is_finite())
+    {
+        return bypass_candidate(original);
+    }
+
+    let settings = StftConfig::new(config.n_fft, config.hop);
+    let mid_spec = stft(mid, &settings);
+    let original_spec = stft(original, &settings);
+    let detection_spec = stft(detection_side, &settings);
+    let candidate_spec = stft(candidate, &settings);
+    let frames = mid_spec
+        .len()
+        .min(original_spec.len())
+        .min(detection_spec.len())
+        .min(candidate_spec.len());
+    if frames == 0 {
+        return bypass_candidate(original);
+    }
+
+    let n_bins = config.n_fft / 2 + 1;
+    let model_start = bin_of(config.fc as f32, config.n_fft, sample_rate).min(n_bins);
+    let defect_map = defects::analyze(
+        &mid_spec[..frames],
+        &detection_spec[..frames],
+        config.scan_start_hz,
+        config.n_fft,
+        sample_rate,
+    );
+    let intact_start =
+        bin_of(config.scan_start_hz as f32, config.n_fft, sample_rate).min(model_start);
+    let intact_end = model_start.max(intact_start + 1).min(n_bins);
+    let boost_power = 10.0f64.powf(config.neural_max_hf_boost_db as f64 / 10.0);
+
+    let mut raw_limits = (0..frames)
+        .map(|frame| {
+            frame_delta_limit(
+                &mid_spec[frame],
+                &original_spec[frame],
+                &candidate_spec[frame],
+                intact_start,
+                intact_end,
+                model_start,
+                &defect_map.masks[frame],
+                boost_power,
+            )
+        })
+        .collect::<Vec<_>>();
+    stabilize_padded_edges(&mut raw_limits, config.n_fft / 2 / config.hop.max(1));
+    let limits = smooth_gain_limits(&raw_limits, 0.10);
+    let minimum_retained_mix = limits.iter().copied().fold(1.0f32, f32::min);
+    let mean_retained_mix = limits.iter().sum::<f32>() / limits.len() as f32;
+    if limits.iter().all(|gain| *gain <= 1e-8) {
+        return GuardedNeuralAudio {
+            signal: original.to_vec(),
+            minimum_retained_mix: 0.0,
+            mean_retained_mix: 0.0,
+        };
+    }
+
+    let mut delta_spec = Vec::with_capacity(frames);
+    for frame in 0..frames {
+        let mut delta_frame = SpectrumFrame::new(n_bins);
+        for bin in model_start..n_bins {
+            let (delta_re, delta_im) = non_cancelling_delta(
+                original_spec[frame].re(bin),
+                original_spec[frame].im(bin),
+                candidate_spec[frame].re(bin),
+                candidate_spec[frame].im(bin),
+            );
+            let mix = limits[frame] * defect_map.masks[frame][bin];
+            delta_frame.cplx[2 * bin] = delta_re * mix;
+            delta_frame.cplx[2 * bin + 1] = delta_im * mix;
+        }
+        delta_spec.push(delta_frame);
+    }
+    let delta = istft(&delta_spec, &settings, original.len());
+    if delta.len() != original.len() || !delta.iter().all(|sample| sample.is_finite()) {
+        return bypass_candidate(original);
+    }
+    GuardedNeuralAudio {
+        signal: original
+            .iter()
+            .zip(delta)
+            .map(|(original, delta)| original + delta)
+            .collect(),
+        minimum_retained_mix,
+        mean_retained_mix,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn frame_delta_limit(
+    mid: &SpectrumFrame,
+    original: &SpectrumFrame,
+    candidate: &SpectrumFrame,
+    intact_start: usize,
+    intact_end: usize,
+    model_start: usize,
+    defect_mask: &[f32],
+    boost_power: f64,
+) -> f32 {
+    let side_mid_ratio = band_energy(original, intact_start, intact_end)
+        / band_energy(mid, intact_start, intact_end).max(1e-12);
+    let side_mid_ratio = side_mid_ratio.clamp(0.0, 4.0);
+    let original_hf = weighted_band_energy(original, defect_mask, model_start);
+    let expected_hf = weighted_band_energy(mid, defect_mask, model_start) * side_mid_ratio;
+    let ceiling = original_hf.max(expected_hf * boost_power);
+
+    let mut projection = 0.0f64;
+    let mut delta_energy = 0.0f64;
+    for bin in model_start..original.n_bins.min(candidate.n_bins) {
+        let frequency_mix = defect_mask.get(bin).copied().unwrap_or(0.0) as f64;
+        let original_re = original.re(bin) as f64;
+        let original_im = original.im(bin) as f64;
+        let (delta_re, delta_im) = non_cancelling_delta(
+            original_re as f32,
+            original_im as f32,
+            candidate.re(bin),
+            candidate.im(bin),
+        );
+        let delta_re = delta_re as f64 * frequency_mix;
+        let delta_im = delta_im as f64 * frequency_mix;
+        projection += original_re * delta_re + original_im * delta_im;
+        delta_energy += delta_re * delta_re + delta_im * delta_im;
+    }
+    if delta_energy <= 1e-20 {
+        return 1.0;
+    }
+    let available = (ceiling - original_hf).max(0.0);
+    let root = (-projection
+        + (projection * projection + delta_energy * available)
+            .max(0.0)
+            .sqrt())
+        / delta_energy;
+    root.clamp(0.0, 1.0) as f32
+}
+
+fn non_cancelling_delta(
+    original_re: f32,
+    original_im: f32,
+    candidate_re: f32,
+    candidate_im: f32,
+) -> (f32, f32) {
+    let mut delta_re = candidate_re - original_re;
+    let mut delta_im = candidate_im - original_im;
+    let original_power = original_re * original_re + original_im * original_im;
+    let projection = original_re * delta_re + original_im * delta_im;
+    if projection < 0.0 && original_power > 1e-20 {
+        let anti_parallel = projection / original_power;
+        delta_re -= anti_parallel * original_re;
+        delta_im -= anti_parallel * original_im;
+    }
+    (delta_re, delta_im)
+}
+
+fn band_energy(frame: &SpectrumFrame, start: usize, end: usize) -> f64 {
+    (start.min(frame.n_bins)..end.min(frame.n_bins))
+        .map(|bin| frame.mag(bin).powi(2) as f64)
+        .sum()
+}
+
+fn weighted_band_energy(frame: &SpectrumFrame, mask: &[f32], start: usize) -> f64 {
+    (start.min(frame.n_bins)..frame.n_bins)
+        .map(|bin| {
+            let weight = mask.get(bin).copied().unwrap_or(0.0) as f64;
+            frame.mag(bin).powi(2) as f64 * weight * weight
+        })
+        .sum()
+}
+
+fn smooth_gain_limits(raw: &[f32], maximum_rise_per_frame: f32) -> Vec<f32> {
+    let mut smoothed = raw.to_vec();
+    for index in 1..smoothed.len() {
+        smoothed[index] = smoothed[index].min(smoothed[index - 1] + maximum_rise_per_frame);
+    }
+    for index in (0..smoothed.len().saturating_sub(1)).rev() {
+        smoothed[index] = smoothed[index].min(smoothed[index + 1] + maximum_rise_per_frame);
+    }
+    smoothed
+}
+
+fn stabilize_padded_edges(values: &mut [f32], requested_edge: usize) {
+    let edge = requested_edge.min(values.len().saturating_sub(1) / 2);
+    if edge == 0 {
+        return;
+    }
+    let left = values[edge];
+    let right = values[values.len() - edge - 1];
+    values[..edge].fill(left);
+    let length = values.len();
+    values[length - edge..].fill(right);
+}
+
+fn bypass_candidate(original: &[f32]) -> GuardedNeuralAudio {
+    GuardedNeuralAudio {
+        signal: original.to_vec(),
+        minimum_retained_mix: 0.0,
+        mean_retained_mix: 0.0,
+    }
 }
 
 fn validate_model_cutoff(
@@ -361,5 +627,99 @@ mod tests {
     fn incompatible_neural_cutoff_is_rejected() {
         let error = validate_model_cutoff(6000, 170, 1024, 48_000).unwrap_err();
         assert!(error.to_string().contains("only supports --fc near"));
+    }
+
+    fn sine(frequency: f32, index: usize, sample_rate: u32) -> f32 {
+        (2.0 * std::f32::consts::PI * frequency * index as f32 / sample_rate as f32).sin()
+    }
+
+    #[test]
+    fn neural_guard_keeps_a_balanced_candidate() {
+        let sample_rate = 48_000;
+        let length = sample_rate as usize;
+        let mid = (0..length)
+            .map(|index| {
+                0.2 * sine(6_000.0, index, sample_rate) + 0.2 * sine(10_000.0, index, sample_rate)
+            })
+            .collect::<Vec<_>>();
+        let original = (0..length)
+            .map(|index| 0.1 * sine(6_000.0, index, sample_rate))
+            .collect::<Vec<_>>();
+        let candidate = original
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| sample + 0.1 * sine(10_000.0, index, sample_rate))
+            .collect::<Vec<_>>();
+
+        let guarded = guard_candidate(&mid, &original, &candidate, &Config::default(), sample_rate);
+        assert!(
+            guarded.mean_retained_mix > 0.95,
+            "retained={}",
+            guarded.mean_retained_mix
+        );
+        assert!(guarded.signal.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn neural_guard_limits_an_abnormally_loud_high_band() {
+        let sample_rate = 48_000;
+        let length = sample_rate as usize;
+        let mid = (0..length)
+            .map(|index| {
+                0.2 * sine(6_000.0, index, sample_rate) + 0.2 * sine(10_000.0, index, sample_rate)
+            })
+            .collect::<Vec<_>>();
+        let original = (0..length)
+            .map(|index| 0.1 * sine(6_000.0, index, sample_rate))
+            .collect::<Vec<_>>();
+        let candidate = original
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| sample + 4.0 * sine(10_000.0, index, sample_rate))
+            .collect::<Vec<_>>();
+
+        let guarded = guard_candidate(&mid, &original, &candidate, &Config::default(), sample_rate);
+        assert!(guarded.mean_retained_mix < 0.1);
+        assert!(
+            guarded
+                .signal
+                .iter()
+                .map(|sample| sample.abs())
+                .fold(0.0f32, f32::max)
+                < 0.5
+        );
+    }
+
+    #[test]
+    fn neural_guard_does_not_cancel_existing_high_frequency_content() {
+        let sample_rate = 48_000;
+        let length = sample_rate as usize;
+        let mid = (0..length)
+            .map(|index| 0.2 * sine(10_000.0, index, sample_rate))
+            .collect::<Vec<_>>();
+        let original = (0..length)
+            .map(|index| 0.05 * sine(10_000.0, index, sample_rate))
+            .collect::<Vec<_>>();
+        let candidate = original.iter().map(|sample| -*sample).collect::<Vec<_>>();
+
+        let guarded = guard_candidate(&mid, &original, &candidate, &Config::default(), sample_rate);
+        let error = guarded
+            .signal
+            .iter()
+            .zip(&original)
+            .map(|(guarded, original)| (guarded - original).powi(2))
+            .sum::<f32>();
+        assert!(error < 1e-10);
+    }
+
+    #[test]
+    fn frame_gain_smoothing_never_exceeds_a_local_limit() {
+        let raw = [1.0, 1.0, 0.1, 1.0, 1.0];
+        let smoothed = smooth_gain_limits(&raw, 0.2);
+        assert!(smoothed
+            .iter()
+            .zip(raw)
+            .all(|(smoothed, raw)| *smoothed <= raw));
+        assert_eq!(smoothed, vec![0.5, 0.3, 0.1, 0.3, 0.5]);
     }
 }

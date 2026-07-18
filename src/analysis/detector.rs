@@ -2,6 +2,7 @@
 
 use crate::analysis::spectrum::{bin_of, log_power, power};
 use crate::analysis::stft::{stft, SpectrumFrame, StftConfig};
+use crate::analysis::{defects, defects::DefectProfile};
 use crate::config::{Config, Route};
 
 /// Metrics for one analyzed segment.
@@ -9,6 +10,8 @@ use crate::config::{Config, Route};
 pub struct SegmentMetrics {
     /// High-frequency energy ratio: E_S(>fc) / E_M(>fc).
     pub r_hf: f32,
+    /// Lower-decile ratio across active STFT frames, exposing deep local dropouts.
+    pub r_hf_low: f32,
     /// Log-spectral distance over [fc, Nyquist] between M and S (lower = more similar).
     pub lsd_hf: f32,
     /// High-frequency normalized cross-correlation between M and S magnitudes.
@@ -21,6 +24,14 @@ pub struct SegmentMetrics {
     pub corr_transition: f32,
     /// S/M energy ratio in the outer half of the cutoff transition.
     pub r_transition: f32,
+    /// Lower-quintile Side/Mid continuity across active 500 Hz bands above the scan start.
+    pub band_continuity: f32,
+    /// Number of persistent deficient 500 Hz bands in this segment.
+    pub deficient_bands: usize,
+    /// Number of persistent Mid-active 500 Hz bands available as repair evidence.
+    pub active_bands: usize,
+    /// First dynamically detected deficient band, if present.
+    pub repair_start_hz: Option<f32>,
 }
 
 /// Report for one segment, including route decision.
@@ -45,13 +56,25 @@ pub fn analyze(
     let stft_cfg = StftConfig::new(cfg.n_fft, cfg.hop);
     let m_spec = stft(m_seg, &stft_cfg);
     let s_spec = stft(s_seg, &stft_cfg);
-    let metrics = compute_metrics(&m_spec, &s_spec, cfg.fc, sample_rate, cfg.n_fft);
-    let needs = cfg.needs_repair(metrics.r_hf, metrics.r_intact);
-    let route = cfg.decide(
+    let mut metrics = compute_metrics(&m_spec, &s_spec, cfg.fc, sample_rate, cfg.n_fft);
+    let profile =
+        defects::analyze(&m_spec, &s_spec, cfg.scan_start_hz, cfg.n_fft, sample_rate).profile;
+    apply_defect_profile(&mut metrics, profile);
+    let threshold = cfg.repair_threshold(metrics.r_intact);
+    let deep_local_dropout = metrics.r_hf_low < threshold * 0.5;
+    let multi_band_dropout =
+        metrics.active_bands >= 8 && metrics.deficient_bands >= 4 && metrics.band_continuity < 0.05;
+    let needs = cfg.needs_repair(metrics.r_hf, metrics.r_intact)
+        || deep_local_dropout
+        || multi_band_dropout;
+    let route = cfg.decide_with_deficiency(
         needs,
         metrics.corr_intact,
         metrics.corr_transition,
         metrics.r_transition,
+        metrics.r_hf,
+        metrics.r_hf_low,
+        metrics.r_intact,
     );
     SegmentReport {
         start,
@@ -60,6 +83,13 @@ pub fn analyze(
         route,
         metrics,
     }
+}
+
+fn apply_defect_profile(metrics: &mut SegmentMetrics, profile: DefectProfile) {
+    metrics.band_continuity = profile.relative_ratio_low;
+    metrics.deficient_bands = profile.deficient_band_count;
+    metrics.active_bands = profile.active_band_count;
+    metrics.repair_start_hz = profile.first_defect_hz;
 }
 
 /// Compute deficiency and routing evidence across aligned frames.
@@ -80,6 +110,7 @@ pub fn compute_metrics(
     let mut corr_num = 0.0f64;
     let mut corr_m_den = 0.0f64;
     let mut corr_s_den = 0.0f64;
+    let mut frame_hf_energy = Vec::with_capacity(m_spec.len().min(s_spec.len()));
     let transition_hz = 500.0f32;
     let intact_lo = bin_of((fc_hz as f32 * 0.75).max(500.0), n_fft, sample_rate).min(fc_bin);
     let intact_hi = bin_of(
@@ -105,6 +136,8 @@ pub fn compute_metrics(
         let s_pow = power(&s_spec[f]);
         let m_log = log_power(&m_spec[f], 1e-10);
         let s_log = log_power(&s_spec[f], 1e-10);
+        let mut frame_m_hf = 0.0f64;
+        let mut frame_s_hf = 0.0f64;
         for b in transition_lo..transition_hi {
             let mr = m_spec[f].re(b) as f64;
             let mi = m_spec[f].im(b) as f64;
@@ -129,6 +162,8 @@ pub fn compute_metrics(
         for b in fc_bin..n_bins {
             e_m_hf += m_pow[b] as f64;
             e_s_hf += s_pow[b] as f64;
+            frame_m_hf += m_pow[b] as f64;
+            frame_s_hf += s_pow[b] as f64;
             let d = ((m_log[b] - m_mean) - (s_log[b] - s_mean)) as f64;
             lsd_sum += d * d;
             lsd_count += 1;
@@ -140,6 +175,7 @@ pub fn compute_metrics(
             corr_m_den += mr * mr + mi * mi;
             corr_s_den += sr * sr + si * si;
         }
+        frame_hf_energy.push((frame_m_hf, frame_s_hf));
     }
 
     let r_hf = if e_m_hf > 1e-12 {
@@ -148,6 +184,25 @@ pub fn compute_metrics(
         1.0e6
     } else {
         1.0
+    };
+    let active_floor = if frames > 0 {
+        e_m_hf / frames as f64 * 0.1
+    } else {
+        0.0
+    };
+    let mut local_ratios = frame_hf_energy
+        .into_iter()
+        .filter(|(mid, _)| *mid > 1e-12 && *mid >= active_floor)
+        .map(|(mid, side)| (side / mid) as f32)
+        .collect::<Vec<_>>();
+    local_ratios.sort_by(f32::total_cmp);
+    let r_hf_low = if local_ratios.is_empty() {
+        r_hf
+    } else {
+        let rank = ((local_ratios.len() - 1) / 10)
+            .max(usize::from(local_ratios.len() >= 3))
+            .min(local_ratios.len() - 1);
+        local_ratios[rank]
     };
     let lsd_hf = if lsd_count > 0 {
         (lsd_sum / lsd_count as f64).sqrt() as f32
@@ -193,12 +248,17 @@ pub fn compute_metrics(
 
     SegmentMetrics {
         r_hf,
+        r_hf_low,
         lsd_hf,
         corr_hf,
         r_intact,
         corr_intact,
         corr_transition,
         r_transition,
+        band_continuity: 1.0,
+        deficient_bands: 0,
+        active_bands: 0,
+        repair_start_hz: None,
     }
 }
 
@@ -348,5 +408,41 @@ mod tests {
         assert!(report.metrics.corr_transition > 0.9);
         assert!(report.metrics.r_transition < Config::default().transition_rhf_min);
         assert_eq!(report.route, Route::Skip);
+    }
+
+    #[test]
+    fn deep_local_dropout_is_not_hidden_by_the_segment_average() {
+        let sample_rate = 48_000;
+        let length = sample_rate as usize;
+        let signal = |frequency: f32, index: usize| {
+            (2.0 * std::f32::consts::PI * frequency * index as f32 / sample_rate as f32).sin()
+        };
+        let mid = (0..length)
+            .map(|index| signal(6_000.0, index) * 0.2 + signal(10_000.0, index) * 0.2)
+            .collect::<Vec<_>>();
+        let side = (0..length)
+            .map(|index| {
+                signal(6_000.0, index) * 0.1
+                    + if index < length * 3 / 4 {
+                        signal(10_000.0, index) * 0.1
+                    } else {
+                        0.0
+                    }
+            })
+            .collect::<Vec<_>>();
+
+        let report = analyze(&mid, &side, 0, length, &Config::default(), sample_rate);
+        let threshold = Config::default().repair_threshold(report.metrics.r_intact);
+        assert!(
+            report.metrics.r_hf >= threshold,
+            "the segment average should remain healthy"
+        );
+        assert!(
+            report.metrics.r_hf_low < threshold * 0.5,
+            "local={}, threshold={threshold}",
+            report.metrics.r_hf_low
+        );
+        assert!(report.needs_processing);
+        assert_eq!(report.route, Route::Dsp);
     }
 }

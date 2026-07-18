@@ -2,7 +2,7 @@
 name = "sidespread"
 version = "0.3.0"
 edition = "2021"
-description = "Repair high-frequency loss in the side channel of AI-generated stereo music"
+description = "Repair missing high-frequency detail in AI-generated stereo music"
 license = "Apache-2.0"
 
 [lib]
@@ -26,6 +26,7 @@ ort = { version = "2.0.0-rc.10", features = ["ndarray", "download-binaries"] }
 rayon = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 sha2 = "0.10"
+terminal_size = "0.4"
 
 [dev-dependencies]
 approx = "0.5"

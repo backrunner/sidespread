@@ -128,7 +128,8 @@ fn download_to(model: &ModelInfo, destination: &Path) -> Result<()> {
         .with_context(|| format!("creating partial model: {}", destination.display()))?;
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut downloaded = 0u64;
-    let mut last_percentage = None;
+    let total_mb = model.size_bytes.div_ceil(1_000_000) as usize;
+    let progress = terminal::TaskProgress::new("MODEL DOWNLOAD", total_mb, "MB");
 
     loop {
         let count = response
@@ -140,13 +141,9 @@ fn download_to(model: &ModelInfo, destination: &Path) -> Result<()> {
         file.write_all(&buffer[..count])
             .context("writing downloaded model")?;
         downloaded += count as u64;
-        let percentage = (downloaded.saturating_mul(100) / model.size_bytes).min(100);
-        if last_percentage != Some(percentage) {
-            terminal::progress("model", downloaded, model.size_bytes);
-            last_percentage = Some(percentage);
-        }
+        progress.set(downloaded.div_ceil(1_000_000) as usize);
     }
-    terminal::finish_progress();
+    progress.finish();
     file.sync_all().context("flushing downloaded model")?;
     terminal::status("VERIFY", "checking size and SHA-256", Tone::Cyan);
     Ok(())
