@@ -7,6 +7,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::terminal::{self, Tone};
+
 const MANIFEST_JSON: &str = include_str!("../models/model-manifest.json");
 
 #[derive(Debug, Deserialize)]
@@ -35,7 +37,7 @@ pub fn download(output: &Path, force: bool) -> Result<()> {
                 output.display()
             )
         })?;
-        println!("model already verified: {}", output.display());
+        terminal::status("VERIFIED", output.display(), Tone::Green);
         return Ok(());
     }
 
@@ -63,15 +65,45 @@ pub fn download(output: &Path, force: bool) -> Result<()> {
     }
     result?;
 
-    println!("model ready: {}", output.display());
+    terminal::status("READY", output.display(), Tone::Green);
     Ok(())
 }
 
 pub fn verify(path: &Path) -> Result<()> {
     let model = model_info()?;
+    terminal::status("VERIFY", path.display(), Tone::Cyan);
     verify_against(path, &model)?;
-    println!("model verified: {}", path.display());
+    terminal::status("VERIFIED", path.display(), Tone::Green);
     Ok(())
+}
+
+pub fn ensure_default_available(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+
+    let model = model_info()?;
+    if !terminal::interactive() {
+        bail!(
+            "UniverSR model is not installed at {}; run `sidespread model download` first",
+            path.display()
+        );
+    }
+
+    let size_mb = model.size_bytes as f64 / 1_000_000.0;
+    terminal::status(
+        "MODEL",
+        format!(
+            "UniverSR is required but is not installed at {}",
+            path.display()
+        ),
+        Tone::Yellow,
+    );
+    let question = format!("Download the UniverSR model now ({size_mb:.0} MB)? [Y/n]");
+    if !terminal::confirm(&question).context("reading model download confirmation")? {
+        bail!("model download cancelled; run `sidespread model download` when ready");
+    }
+    download(path, false)
 }
 
 fn model_info() -> Result<ModelInfo> {
@@ -81,6 +113,7 @@ fn model_info() -> Result<ModelInfo> {
 }
 
 fn download_to(model: &ModelInfo, destination: &Path) -> Result<()> {
+    terminal::status("DOWNLOAD", "fetching the UniverSR model", Tone::Cyan);
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("sidespread/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -109,13 +142,13 @@ fn download_to(model: &ModelInfo, destination: &Path) -> Result<()> {
         downloaded += count as u64;
         let percentage = (downloaded.saturating_mul(100) / model.size_bytes).min(100);
         if last_percentage != Some(percentage) {
-            eprint!("\rdownloading model: {percentage:3}%");
-            std::io::stderr().flush().ok();
+            terminal::progress("model", downloaded, model.size_bytes);
             last_percentage = Some(percentage);
         }
     }
-    eprintln!();
+    terminal::finish_progress();
     file.sync_all().context("flushing downloaded model")?;
+    terminal::status("VERIFY", "checking size and SHA-256", Tone::Cyan);
     Ok(())
 }
 

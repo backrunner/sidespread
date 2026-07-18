@@ -21,10 +21,20 @@ Process a stereo WAV:
 
 ```bash
 ./target/release/sidespread process song.wav
+# The command name is optional:
+./target/release/sidespread song.wav
 ```
 
 This writes `song.repaired.wav` and `report.json`. If the track already has enough side-channel high
 frequency content, Sidespread leaves it alone and writes only the report.
+
+The terminal report uses color, section headers, status markers, and a compact segment table when
+connected to a TTY. Output automatically falls back to plain ASCII for pipes and CI; set
+`FORCE_COLOR=1` to opt into color explicitly, or `NO_COLOR=1` to disable it.
+
+If a neural repair route is selected and the default UniverSR model is missing, Sidespread asks
+whether it should download the model (about 232 MB). Use `sidespread model download` to install it
+ahead of time, or answer `n` to keep the current run offline.
 
 The default workflow is intentionally automatic. It detects deficient sections, estimates their
 natural side level from nearby intact frequencies, and adds only the missing high-frequency energy.

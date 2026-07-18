@@ -8,3 +8,4 @@ pub mod io;
 pub mod model;
 pub mod pipeline;
 pub mod repair;
+pub mod terminal;

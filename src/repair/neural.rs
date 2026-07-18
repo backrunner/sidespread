@@ -42,6 +42,10 @@ impl NeuralState {
             config.n_fft,
             config.target_sr,
         )?;
+        if sidespread_config.model_path.is_none() && !config.model_onnx.exists() {
+            crate::model::ensure_default_available(&config.model_onnx)
+                .context("installing the default UniverSR model")?;
+        }
         let sessions = Sessions::load(&config.model_onnx).with_context(|| {
             format!(
                 "loading UniverSR model {}; install the default model with \

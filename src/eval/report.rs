@@ -2,6 +2,7 @@
 
 use crate::analysis::detector::SegmentReport;
 use crate::eval::metrics::{EvaluationMetrics, ProcessingMetrics};
+use crate::terminal::{self, Tone};
 use anyhow::Result;
 use serde::Serialize;
 use std::path::Path;
@@ -27,54 +28,83 @@ pub fn print_summary(report: &Report) {
         .iter()
         .filter(|segment| segment.needs_processing)
         .count();
-    println!("- sidespread report --------------------------------");
-    println!("segments analyzed : {total}");
-    println!("segments needing  : {needs}");
+    terminal::header("SIDESPREAD", "analysis report");
+    let (state, tone) = if report.needs_processing {
+        ("REPAIR NEEDED", Tone::Yellow)
+    } else {
+        ("HEALTHY", Tone::Green)
+    };
+    println!("  {:<20} {}", "status", terminal::paint(state, tone));
+    println!("  {:<20} {total}", "segments analyzed");
+    println!("  {:<20} {needs}", "segments flagged");
 
     if let Some(overall) = &report.overall {
-        println!("- before / after ----------------------------------");
+        terminal::section("Before / after");
+        println!("  {:<20} {:>12} {:>12}", "metric", "before", "after");
+        println!("  {}", "-".repeat(46));
         println!(
-            "r_hf  {:8.4} -> {:8.4}    lsd_hf {:8.4} -> {:8.4}",
-            overall.before.r_hf, overall.after.r_hf, overall.before.lsd_hf, overall.after.lsd_hf
+            "  {:<20} {:>12.4} {}",
+            "side / mid HF",
+            overall.before.r_hf,
+            terminal::paint(format!("{:>12.4}", overall.after.r_hf), Tone::Cyan)
         );
         println!(
-            "mcd   {:8.4} -> {:8.4}    iccc   {:8.4} -> {:8.4}",
-            overall.before.mcd, overall.after.mcd, overall.before.iccc_hf, overall.after.iccc_hf
+            "  {:<20} {:>12.4} {}",
+            "HF spectral distance",
+            overall.before.lsd_hf,
+            terminal::paint(format!("{:>12.4}", overall.after.lsd_hf), Tone::Cyan)
         );
         println!(
-            "output gain: {:.2} dB    synthesis mix: {:.1}%",
+            "  {:<20} {:>12.4} {}",
+            "cepstral distance",
+            overall.before.mcd,
+            terminal::paint(format!("{:>12.4}", overall.after.mcd), Tone::Cyan)
+        );
+        println!(
+            "  {:<20} {:>12.4} {}",
+            "HF correlation",
+            overall.before.iccc_hf,
+            terminal::paint(format!("{:>12.4}", overall.after.iccc_hf), Tone::Cyan)
+        );
+        println!(
+            "\n  output gain  {:+.2} dB    synthesis mix  {:.1}%",
             overall.output_gain_db,
             overall.synthesis_mix * 100.0
         );
     }
 
     if let Some(evaluation) = &report.evaluation {
-        println!("- ground truth ------------------------------------");
+        terminal::section("Ground truth evaluation");
         println!(
-            "reference r_hf={:.4} lsd_hf={:.4} iccc={:.4}",
+            "  reference  r_hf {:.4}   lsd_hf {:.4}   iccc {:.4}",
             evaluation.reference.r_hf, evaluation.reference.lsd_hf, evaluation.reference.iccc_hf
         );
         println!(
-            "lsd_hf {:8.4} -> {:8.4}    snr_hf {} -> {}",
+            "  lsd_hf     {:8.4} -> {:8.4}    snr_hf {} -> {}",
             evaluation.degraded.lsd_hf,
             evaluation.repaired.lsd_hf,
             display_optional(evaluation.degraded.snr_hf_db),
             display_optional(evaluation.repaired.snr_hf_db)
         );
         println!(
-            "snr_db {} -> {}    snr_preserved {} -> {}",
+            "  snr_db {} -> {}    snr_preserved {} -> {}",
             display_optional(evaluation.degraded.snr_db),
             display_optional(evaluation.repaired.snr_db),
             display_optional(evaluation.degraded.snr_preserved_db),
             display_optional(evaluation.repaired.snr_preserved_db)
         );
         println!(
-            "existing HF projection: {} dB",
+            "  existing HF projection  {} dB",
             display_optional(evaluation.existing_hf_projection_db)
         );
     }
 
-    println!("- per-segment -------------------------------------");
+    terminal::section("Segments");
+    println!(
+        "  {:>15}  {:<8} {:>7} {:>7} {:>6} {:>6} {:>7}",
+        "sample range", "route", "R_hf", "LSD", "corr-I", "corr-T", "R-trans"
+    );
+    println!("  {}", "-".repeat(68));
     let shown = if total > 20 {
         report
             .segments
@@ -87,10 +117,10 @@ pub fn print_summary(report: &Report) {
     };
     for segment in shown {
         println!(
-            "[{:6}..{:6}] route={:<7} r_hf={:.3} lsd={:.3} corr_i={:.3} corr_t={:.3} r_t={:.4}",
+            "  {:6}..{:<6}  {} {:>7.3} {:>7.3} {:>6.3} {:>6.3} {:>7.4}",
             segment.start,
             segment.end,
-            segment.route,
+            terminal::route_label(format!("{:<8}", segment.route)),
             segment.metrics.r_hf,
             segment.metrics.lsd_hf,
             segment.metrics.corr_intact,
@@ -99,8 +129,15 @@ pub fn print_summary(report: &Report) {
         );
     }
     if total > 20 {
-        println!("... ({}) segments omitted ...", total - 20);
+        println!(
+            "  {}",
+            terminal::paint(
+                format!("... {} segments omitted ...", total - 20),
+                Tone::Muted
+            )
+        );
     }
+    println!();
 }
 
 fn display_optional(value: Option<f32>) -> String {

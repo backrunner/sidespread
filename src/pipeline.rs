@@ -12,6 +12,7 @@ use crate::eval::report::{print_summary, write_json, Report};
 use crate::eval::synthetic;
 use crate::io::{lr_to_ms, ms_to_lr, read_wav, write_wav, AudioBuffer};
 use crate::repair;
+use crate::terminal::{self, Tone};
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use std::path::Path;
@@ -36,27 +37,56 @@ pub fn info<P: AsRef<Path>>(input: P, fc: usize) -> Result<()> {
         config.n_fft,
     );
 
-    println!("- file --------------------------------------------");
-    println!("path        : {}", input.display());
-    println!("sample_rate : {} Hz", buffer.sample_rate);
-    println!("channels    : {}", buffer.channels());
-    println!("bits/sample : {}", buffer.bits_per_sample);
-    println!("sample fmt  : {:?}", buffer.sample_format);
-    println!("frames      : {}", buffer.frames());
-    println!("duration    : {:.3} s", buffer.duration_secs());
-    println!("- M/S high-frequency analysis (fc={fc} Hz) -------");
-    println!("R_hf    : {:.4}", metrics.r_hf);
-    println!("LSD_hf  : {:.4} dB", metrics.lsd_hf);
-    println!("corr_hf : {:.4}", metrics.corr_hf);
-    println!("R_intact: {:.4}", metrics.r_intact);
-    println!("corr_int: {:.4}", metrics.corr_intact);
-    println!("R_trans : {:.6}", metrics.r_transition);
-    println!("corr_trn : {:.4}", metrics.corr_transition);
-    if config.needs_repair(metrics.r_hf, metrics.r_intact) {
-        println!("side HF appears deficient; run `sidespread process`.");
+    terminal::header("SIDESPREAD", "audio inspection");
+    terminal::section("File");
+    println!("  {:<18} {}", "path", input.display());
+    println!("  {:<18} {} Hz", "sample rate", buffer.sample_rate);
+    println!("  {:<18} {}", "channels", buffer.channels());
+    println!(
+        "  {:<18} {}-bit {:?}",
+        "format", buffer.bits_per_sample, buffer.sample_format
+    );
+    println!("  {:<18} {}", "frames", buffer.frames());
+    println!("  {:<18} {:.3} s", "duration", buffer.duration_secs());
+
+    terminal::section(&format!("M/S high-frequency analysis - {fc} Hz cutoff"));
+    println!("  {:<18} {:>10}", "metric", "value");
+    println!("  {}", "-".repeat(30));
+    println!("  {:<18} {:>10.4}", "side / mid HF", metrics.r_hf);
+    println!("  {:<18} {:>10.4} dB", "spectral distance", metrics.lsd_hf);
+    println!("  {:<18} {:>10.4}", "HF correlation", metrics.corr_hf);
+    println!("  {:<18} {:>10.4}", "intact ratio", metrics.r_intact);
+    println!(
+        "  {:<18} {:>10.4}",
+        "intact correlation", metrics.corr_intact
+    );
+    println!(
+        "  {:<18} {:>10.6}",
+        "transition ratio", metrics.r_transition
+    );
+    println!(
+        "  {:<18} {:>10.4}",
+        "transition corr.", metrics.corr_transition
+    );
+
+    let needs_repair = config.needs_repair(metrics.r_hf, metrics.r_intact);
+    let (state, detail, tone) = if needs_repair {
+        (
+            "REPAIR",
+            "Side-channel high frequencies are deficient. Run `sidespread process`.",
+            Tone::Yellow,
+        )
     } else {
-        println!("side HF looks healthy; no repair is likely needed.");
-    }
+        (
+            "HEALTHY",
+            "Side-channel high frequencies look healthy.",
+            Tone::Green,
+        )
+    };
+    println!(
+        "\n  {} {detail}\n",
+        terminal::paint(format!("[{state}]"), tone)
+    );
     Ok(())
 }
 
@@ -65,10 +95,18 @@ pub fn detect<P: AsRef<Path>, Q: AsRef<Path>>(
     config: &Config,
     report_path: Q,
 ) -> Result<()> {
-    let buffer = read_wav(input.as_ref()).context("reading wav")?;
+    let input = input.as_ref();
+    let report_path = report_path.as_ref();
+    terminal::status("READ", input.display(), Tone::Cyan);
+    let buffer = read_wav(input).context("reading wav")?;
     ensure_nonempty(&buffer)?;
     config.validate(buffer.sample_rate)?;
     let (m, s) = crate::io::mside::lr_to_ms(&buffer)?;
+    terminal::status(
+        "ANALYZE",
+        "measuring side-channel high frequencies",
+        Tone::Cyan,
+    );
     let (_, reports) = analyze_all(&m, &s, buffer.sample_rate, config);
     let report = Report {
         needs_processing: reports.iter().any(|segment| segment.needs_processing),
@@ -78,10 +116,15 @@ pub fn detect<P: AsRef<Path>, Q: AsRef<Path>>(
     };
     print_summary(&report);
     write_json(&report, report_path).context("writing report")?;
+    terminal::status("REPORT", report_path.display(), Tone::Green);
     if report.needs_processing {
-        eprintln!("audio needs processing; run `sidespread process` to repair it.");
+        terminal::status(
+            "REPAIR",
+            "audio needs processing; run `sidespread process` to repair it",
+            Tone::Yellow,
+        );
     } else {
-        eprintln!("audio does not need processing.");
+        terminal::status("HEALTHY", "audio does not need processing", Tone::Green);
     }
     Ok(())
 }
@@ -94,10 +137,13 @@ pub fn process<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
 ) -> Result<()> {
     let input = input.as_ref();
     let output = output.as_ref();
+    let report_path = report_path.as_ref();
+    terminal::status("READ", input.display(), Tone::Cyan);
     let buffer = read_wav(input).context("reading wav")?;
     ensure_nonempty(&buffer)?;
     config.validate(buffer.sample_rate)?;
     let (m, s) = crate::io::mside::lr_to_ms(&buffer)?;
+    terminal::status("ANALYZE", "finding repair candidates", Tone::Cyan);
     let (segment_ranges, reports) = analyze_all(&m, &s, buffer.sample_rate, config);
     let needs_processing = reports.iter().any(|segment| segment.needs_processing);
     let has_repair_route = reports.iter().any(|segment| segment.route != Route::Skip);
@@ -117,18 +163,28 @@ pub fn process<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
         };
         print_summary(&report);
         write_json(&report, report_path).context("writing report")?;
+        terminal::status("REPORT", report_path.display(), Tone::Green);
         if needs_processing {
             if config.mode == Mode::Skip {
-                eprintln!("repair skipped by --mode skip; no WAV was written.");
+                terminal::status("SKIP", "repair disabled; no WAV was written", Tone::Yellow);
             } else {
-                eprintln!("no segments met repair confidence; no WAV was written.");
+                terminal::status(
+                    "SKIP",
+                    "no segments met repair confidence; no WAV was written",
+                    Tone::Yellow,
+                );
             }
         } else {
-            eprintln!("audio does not need processing; only the report was written.");
+            terminal::status(
+                "HEALTHY",
+                "audio does not need processing; only the report was written",
+                Tone::Green,
+            );
         }
         return Ok(());
     }
 
+    terminal::status("REPAIR", "rebuilding side-channel detail", Tone::Yellow);
     let repaired_side = repair_segments(
         &m,
         &s,
@@ -140,6 +196,7 @@ pub fn process<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     let (output_mid, output_side, output_gain_db, synthesis_mix) =
         fit_output_headroom(&m, &s, &repaired_side);
     let output_buffer = ms_to_lr(&output_mid, &output_side, &buffer);
+    terminal::status("WRITE", output.display(), Tone::Cyan);
     write_wav(output, &output_buffer).context("writing output wav")?;
     let written_buffer = read_wav(output).context("reading written output wav")?;
     let (written_m, written_side) = lr_to_ms(&written_buffer)?;
@@ -158,7 +215,8 @@ pub fn process<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     };
     print_summary(&report);
     write_json(&report, report_path).context("writing report")?;
-    eprintln!("wrote {}", output.display());
+    terminal::status("DONE", output.display(), Tone::Green);
+    terminal::status("REPORT", report_path.display(), Tone::Green);
     Ok(())
 }
 
@@ -170,6 +228,8 @@ pub fn eval<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
 ) -> Result<()> {
     let clean = clean.as_ref();
     let output = output.as_ref();
+    let report_path = report_path.as_ref();
+    terminal::status("READ", clean.display(), Tone::Cyan);
     let buffer = read_wav(clean).context("reading clean wav")?;
     ensure_nonempty(&buffer)?;
     config.validate(buffer.sample_rate)?;
@@ -229,7 +289,8 @@ pub fn eval<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     };
     print_summary(&report);
     write_json(&report, report_path).context("writing report")?;
-    eprintln!("wrote {}", output.display());
+    terminal::status("DONE", output.display(), Tone::Green);
+    terminal::status("REPORT", report_path.display(), Tone::Green);
     Ok(())
 }
 

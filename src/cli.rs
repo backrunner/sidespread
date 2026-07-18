@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::pipeline;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -116,7 +117,7 @@ pub enum ModelCommand {
 }
 
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_args(std::env::args_os()).unwrap_or_else(|error| error.exit());
     match cli.command {
         Command::Model { command } => match command {
             ModelCommand::Download { output, force } => crate::model::download(&output, force),
@@ -176,6 +177,30 @@ pub fn run() -> Result<()> {
     }
 }
 
+fn parse_args<I>(args: I) -> std::result::Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let args = args.into_iter().collect::<Vec<_>>();
+    let args = if should_use_process_alias(&args) {
+        let mut normalized = Vec::with_capacity(args.len() + 1);
+        normalized.push(args[0].clone());
+        normalized.push(OsString::from("process"));
+        normalized.extend(args.into_iter().skip(1));
+        normalized
+    } else {
+        args
+    };
+    Cli::try_parse_from(args)
+}
+
+fn should_use_process_alias(args: &[OsString]) -> bool {
+    let Some(first) = args.get(1).and_then(|value| value.to_str()) else {
+        return false;
+    };
+    !first.starts_with('-') && !matches!(first, "process" | "detect" | "eval" | "info" | "model")
+}
+
 fn default_output_path(input: &Path, suffix: &str) -> PathBuf {
     let mut file_name = input
         .file_stem()
@@ -199,12 +224,40 @@ fn parse_corr(v: &[f32]) -> Result<(f32, f32)> {
 mod tests {
     use super::*;
 
+    fn parse(values: &[&str]) -> Cli {
+        parse_args(values.iter().map(OsString::from)).unwrap()
+    }
+
     #[test]
     fn process_default_output_preserves_repaired_suffix() {
         let input = Path::new("/tmp/song.wav");
         let output = default_output_path(input, ".repaired");
         assert_eq!(output, Path::new("/tmp/song.repaired.wav"));
         assert_ne!(output, input);
+    }
+
+    #[test]
+    fn bare_audio_path_is_an_alias_for_process() {
+        assert!(matches!(
+            parse(&["sidespread", "song.wav"]).command,
+            Command::Process { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_subcommands_are_not_rewritten() {
+        assert!(matches!(
+            parse(&["sidespread", "info", "song.wav"]).command,
+            Command::Info { .. }
+        ));
+    }
+
+    #[test]
+    fn help_is_not_rewritten_as_an_audio_path() {
+        let error = parse_args([OsString::from("sidespread"), OsString::from("--help")])
+            .err()
+            .expect("help should short-circuit parsing");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
     #[test]
