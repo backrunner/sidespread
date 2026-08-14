@@ -1,3 +1,5 @@
+
+
 # Sidespread
 
 Sidespread fills in missing upper-mid and high-frequency detail in stereo music. It is aimed at
@@ -204,7 +206,7 @@ engineering validation, not a substitute for level-matched listening tests.
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
